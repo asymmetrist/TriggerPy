@@ -1,6 +1,7 @@
 import threading
 import time
 import logging
+import gc
 from Helpers.Order import Order, OrderState
 from Services.order_manager import order_manager
 from Services.watcher_info import (
@@ -601,7 +602,11 @@ class OrderWaitService:
     def _handle_premarket_trigger(self, order_id: str, order: Order, tinfo: ThreadInfo, last_price: float):
         """
         Handle trigger hit during premarket.
-        Prompts user to rebase or cancel, then continues watching.
+        Shows popup dialog prompting user to rebase or cancel.
+        When rebasing, updates trigger to new premarket extreme AND strike to ATM (closest to trigger).
+        - CALLS: closest strike >= trigger (upside)
+        - PUTS: closest strike <= trigger (downside)
+        - NO AUTO-REBASE: User must choose. Timeout = cancel order.
         """
         cb = getattr(order, "_status_callback", None)
         
@@ -616,58 +621,7 @@ class OrderWaitService:
                     model = m
                     break
         
-        if model:
-            # Get latest premarket extreme and calculate new trigger/strike
-            if not is_market_closed_or_pre_market():
-                # Shouldn't happen, but just in case
-                logging.warning(f"[WaitService] _handle_premarket_trigger called outside premarket")
-                return
-            
-            from model import general_app
-            market_data = general_app.get_market_data_for_trigger(order.symbol, 'premarket')
-            if market_data:
-                new_trigger = (
-                    market_data["high"] if order.right in ("C", "CALL")
-                    else market_data["low"]
-                )
-                
-                if new_trigger and new_trigger > 0:
-                    # Keep original strike - only update trigger
-                    # Update order
-                    old_trigger = order.trigger
-                    order.trigger = new_trigger
-                    # Strike stays as original - don't recalculate
-                    
-                    logging.info(
-                        f"[WaitService] Auto-rebased premarket trigger | order_id={order_id} | "
-                        f"old_trigger={old_trigger} | new_trigger={new_trigger} | strike={order.strike} (unchanged)"
-                    )
-                    if cb:
-                        cb(
-                            f"Premarket trigger hit @ {last_price:.2f} - Auto-rebased to {new_trigger:.2f}",
-                            "blue"
-                        )
-                else:
-                    # Rebase failed - no valid market data
-                    logging.warning(
-                        f"[WaitService] Premarket trigger hit but invalid market data | order_id={order_id}"
-                    )
-                    if cb:
-                        cb(
-                            f"⚠️ Premarket trigger hit @ {last_price:.2f} - Rebase failed. Order watching continues.",
-                            "orange"
-                        )
-            else:
-                # Rebase failed - no market data
-                logging.warning(
-                    f"[WaitService] Premarket trigger hit but no market data | order_id={order_id}"
-                )
-                if cb:
-                    cb(
-                        f"⚠️ Premarket trigger hit @ {last_price:.2f} - Rebase failed. Order watching continues.",
-                        "orange"
-                    )
-        else:
+        if not model:
             logging.warning(
                 f"[WaitService] Premarket trigger hit but no model found | order_id={order_id}"
             )
@@ -676,10 +630,301 @@ class OrderWaitService:
                     f"⚠️ Premarket trigger hit @ {last_price:.2f} - Order watching continues.",
                     "orange"
                 )
+            if tinfo:
+                tinfo.update_status(STATUS_RUNNING, last_price=last_price)
+            return
         
-        # Update watcher status
-        if tinfo:
-            tinfo.update_status(STATUS_RUNNING, last_price=last_price)
+        # Get latest premarket extreme and calculate new trigger
+        if not is_market_closed_or_pre_market():
+            logging.warning(f"[WaitService] _handle_premarket_trigger called outside premarket")
+            return
+        
+        from model import general_app
+        market_data = general_app.get_market_data_for_trigger(order.symbol, 'premarket')
+        if not market_data:
+            logging.warning(
+                f"[WaitService] Premarket trigger hit but no market data | order_id={order_id}"
+            )
+            if cb:
+                cb(
+                    f"⚠️ Premarket trigger hit @ {last_price:.2f} - Rebase failed. Order watching continues.",
+                    "orange"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_RUNNING, last_price=last_price)
+            return
+        
+        new_trigger = (
+            market_data["high"] if order.right in ("C", "CALL")
+            else market_data["low"]
+        )
+        
+        if not new_trigger or new_trigger <= 0:
+            logging.warning(
+                f"[WaitService] Premarket trigger hit but invalid market data | order_id={order_id}"
+            )
+            if cb:
+                cb(
+                    f"⚠️ Premarket trigger hit @ {last_price:.2f} - Rebase failed. Order watching continues.",
+                    "orange"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_RUNNING, last_price=last_price)
+            return
+        
+        # ✅ Calculate ATM strike based on trigger price (not current price)
+        # For CALLS: closest strike >= trigger (upside)
+        # For PUTS: closest strike <= trigger (downside)
+        atm_strike = None
+        try:
+            if model._expiry:
+                available_strikes = model.get_available_strikes(model._expiry)
+                if available_strikes:
+                    if order.right in ("C", "CALL"):
+                        # CALL: Find closest strike >= trigger (upside)
+                        eligible_strikes = [s for s in available_strikes if s >= new_trigger]
+                        if eligible_strikes:
+                            atm_strike = min(eligible_strikes, key=lambda s: abs(s - new_trigger))
+                            logging.info(
+                                f"[WaitService] CALL: Calculated ATM strike: {atm_strike} "
+                                f"(trigger={new_trigger:.2f}, eligible strikes >= trigger: {len(eligible_strikes)})"
+                            )
+                        else:
+                            # Fallback: if no strike >= trigger, use closest overall
+                            atm_strike = min(available_strikes, key=lambda s: abs(s - new_trigger))
+                            logging.warning(
+                                f"[WaitService] CALL: No strike >= trigger, using closest: {atm_strike}"
+                            )
+                    else:
+                        # PUT: Find closest strike <= trigger (downside)
+                        eligible_strikes = [s for s in available_strikes if s <= new_trigger]
+                        if eligible_strikes:
+                            atm_strike = max(eligible_strikes, key=lambda s: abs(s - new_trigger))
+                            logging.info(
+                                f"[WaitService] PUT: Calculated ATM strike: {atm_strike} "
+                                f"(trigger={new_trigger:.2f}, eligible strikes <= trigger: {len(eligible_strikes)})"
+                            )
+                        else:
+                            # Fallback: if no strike <= trigger, use closest overall
+                            atm_strike = min(available_strikes, key=lambda s: abs(s - new_trigger))
+                            logging.warning(
+                                f"[WaitService] PUT: No strike <= trigger, using closest: {atm_strike}"
+                            )
+                else:
+                    logging.warning(
+                        f"[WaitService] No available strikes for expiry {model._expiry} - keeping original strike"
+                    )
+            else:
+                logging.warning(
+                    f"[WaitService] No expiry set in model - cannot calculate ATM strike"
+                )
+        except Exception as e:
+            logging.error(f"[WaitService] Error calculating ATM strike: {e}", exc_info=True)
+        
+        # ✅ Show popup dialog to user (NO AUTO-REBASE)
+        import tkinter as tk
+        from tkinter import ttk
+        
+        user_choice = None  # "rebase" or "cancel"
+        choice_event = threading.Event()
+        
+        # Find the OrderFrame widget that has this model
+        widget = None
+        try:
+            import main
+            app = None
+            # Try to get the main app instance
+            logging.info(f"[WaitService] Searching for ArcTriggerApp instance...")
+            for obj in gc.get_objects():
+                if isinstance(obj, main.ArcTriggerApp):
+                    app = obj
+                    logging.info(f"[WaitService] ✅ Found ArcTriggerApp instance: {app}")
+                    break
+            
+            if app:
+                logging.info(f"[WaitService] Checking {len(app.order_frames)} order frames for matching model")
+                # Find OrderFrame with matching model
+                for idx, frame in enumerate(app.order_frames):
+                    if hasattr(frame, 'model'):
+                        if frame.model == model:
+                            widget = frame
+                            logging.info(f"[WaitService] ✅ Found matching widget at index {idx} for model {model.symbol}")
+                            break
+                        else:
+                            logging.debug(f"[WaitService] Frame {idx}: model={getattr(frame.model, 'symbol', 'None')}, target={model.symbol}")
+                    else:
+                        logging.debug(f"[WaitService] Frame {idx}: no model attribute")
+                
+                if not widget:
+                    logging.warning(f"[WaitService] ❌ No matching widget found in {len(app.order_frames)} frames for model {model.symbol}")
+            else:
+                logging.warning(f"[WaitService] ❌ No ArcTriggerApp instance found in gc.get_objects()")
+        except Exception as e:
+            logging.error(f"[WaitService] ❌ Exception finding widget for popup: {e}", exc_info=True)
+        
+        if not widget:
+            # ✅ NO AUTO-REBASE: If widget not found, cancel the order
+            logging.error(
+                f"[WaitService] Widget not found - cancelling order (no auto-rebase) | order_id={order_id}"
+            )
+            self.cancel_order(order_id)
+            if cb:
+                cb(
+                    f"⚠️ Premarket trigger hit @ {last_price:.2f} - Order cancelled (UI unavailable)",
+                    "red"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_CANCELLED, last_price=last_price)
+            return
+        
+        # Show popup dialog in UI thread
+        def show_popup():
+            try:
+                popup = tk.Toplevel(widget)
+                popup.title("⚠️ Premarket Trigger Hit")
+                popup.geometry("450x220")
+                popup.configure(bg="#222")
+                popup.grab_set()  # Make it modal
+                popup.transient(widget.winfo_toplevel())  # Keep on top
+                
+                # Center the popup
+                popup.update_idletasks()
+                x = (popup.winfo_screenwidth() // 2) - (popup.winfo_width() // 2)
+                y = (popup.winfo_screenheight() // 2) - (popup.winfo_height() // 2)
+                popup.geometry(f"+{x}+{y}")
+                
+                # Title
+                ttk.Label(
+                    popup,
+                    text=f"Premarket Trigger Hit: {order.symbol}",
+                    font=("Arial", 12, "bold"),
+                    background="#222",
+                    foreground="white"
+                ).pack(pady=(15, 5))
+                
+                # Details
+                strike_info = f"New Strike: ${atm_strike:.2f} (ATM)" if atm_strike else "Strike: (unchanged)"
+                details_text = (
+                    f"Current Price: ${last_price:.2f}\n"
+                    f"Old Trigger: ${order.trigger:.2f} → New: ${new_trigger:.2f}\n"
+                    f"Old Strike: ${order.strike:.2f} → {strike_info}"
+                )
+                ttk.Label(
+                    popup,
+                    text=details_text,
+                    font=("Arial", 9),
+                    background="#222",
+                    foreground="#ccc",
+                    justify="left"
+                ).pack(pady=(5, 15))
+                
+                # Buttons
+                btn_frame = ttk.Frame(popup)
+                btn_frame.pack(pady=10)
+                
+                def choose_rebase():
+                    nonlocal user_choice
+                    user_choice = "rebase"
+                    popup.destroy()
+                    choice_event.set()
+                
+                def choose_cancel():
+                    nonlocal user_choice
+                    user_choice = "cancel"
+                    popup.destroy()
+                    choice_event.set()
+                
+                ttk.Button(
+                    btn_frame,
+                    text="Rebase to New Trigger + ATM",
+                    command=choose_rebase,
+                    width=20
+                ).pack(side="left", padx=10)
+                
+                ttk.Button(
+                    btn_frame,
+                    text="Cancel Order",
+                    command=choose_cancel,
+                    width=18
+                ).pack(side="left", padx=10)
+                
+            except Exception as e:
+                logging.error(f"[WaitService] Popup error: {e}", exc_info=True)
+                # ✅ NO AUTO-REBASE: On error, cancel the order
+                user_choice = "cancel"
+                choice_event.set()
+        
+        # Schedule popup in UI thread
+        widget.after(0, show_popup)
+        
+        # Wait for user response (with 60 second timeout → CANCEL if timeout)
+        timeout_occurred = not choice_event.wait(timeout=60.0)
+        
+        # Handle user choice
+        if timeout_occurred:
+            # ✅ Timeout = cancel order (NO AUTO-REBASE)
+            logging.warning(
+                f"[WaitService] Premarket trigger popup timeout (60s) - cancelling order | order_id={order_id}"
+            )
+            self.cancel_order(order_id)
+            if cb:
+                cb(
+                    f"Premarket trigger hit @ {last_price:.2f} - Order cancelled (timeout)",
+                    "orange"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_CANCELLED, last_price=last_price)
+        elif user_choice == "rebase":
+            old_trigger = order.trigger
+            old_strike = order.strike
+            order.trigger = new_trigger
+            if atm_strike:
+                order.strike = atm_strike
+                model._strike = atm_strike
+                logging.info(
+                    f"[WaitService] User chose to rebase premarket trigger + ATM strike | order_id={order_id} | "
+                    f"old_trigger={old_trigger} | new_trigger={new_trigger} | "
+                    f"old_strike={old_strike} | new_strike={atm_strike} (ATM)"
+                )
+            else:
+                logging.info(
+                    f"[WaitService] User chose to rebase premarket trigger (strike unchanged) | order_id={order_id} | "
+                    f"old_trigger={old_trigger} | new_trigger={new_trigger} | strike={order.strike}"
+                )
+            if cb:
+                strike_msg = f", strike → {atm_strike:.2f} (ATM)" if atm_strike else ""
+                cb(
+                    f"Premarket trigger hit @ {last_price:.2f} - Rebased to {new_trigger:.2f}{strike_msg}",
+                    "blue"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_RUNNING, last_price=last_price)
+        elif user_choice == "cancel":
+            # Cancel the order
+            self.cancel_order(order_id)
+            logging.info(
+                f"[WaitService] User chose to cancel order after premarket trigger | order_id={order_id}"
+            )
+            if cb:
+                cb(
+                    f"Premarket trigger hit @ {last_price:.2f} - Order cancelled by user",
+                    "orange"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_CANCELLED, last_price=last_price)
+        else:
+            # Should not happen, but just in case
+            logging.error(
+                f"[WaitService] Unknown user choice: {user_choice} - cancelling order | order_id={order_id}"
+            )
+            self.cancel_order(order_id)
+            if cb:
+                cb(
+                    f"Premarket trigger hit @ {last_price:.2f} - Order cancelled (unknown state)",
+                    "red"
+                )
+            if tinfo:
+                tinfo.update_status(STATUS_CANCELLED, last_price=last_price)
 
     def _finalize_order(self, order_id: str, order: Order, tinfo: ThreadInfo, last_price):
         """Sends the entry order to TWS and handles cleanup and status updates."""
