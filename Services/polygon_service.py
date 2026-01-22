@@ -17,8 +17,19 @@ from Services.nasdaq_info import EASTERN, MARKET_OPEN
 # Try to load dotenv if available (optional dependency)
 try:
     from dotenv import load_dotenv
+    import sys
+    
+    # ✅ FIX: Look for .env file in the executable's directory (for PyInstaller)
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        exe_dir = os.path.dirname(sys.executable)
+        env_path = os.path.join(exe_dir, '.env')
+    else:
+        # Running as script
+        env_path = '.env'
+    
     # Load .env file, don't override existing env vars, don't resolve variables
-    load_dotenv(override=False, interpolate=False)
+    load_dotenv(env_path, override=False, interpolate=False)
 except ImportError:
     # dotenv not installed, will use system environment variables
     pass

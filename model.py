@@ -666,14 +666,14 @@ class AppModel:
         if not self._validate_breakout_trigger(trigger_price, current_price):
             raise ValueError(f"Trigger {trigger_price} invalid for current price {current_price}")
 
-        # --- premium resolved ONCE ---
-        mid_premium = self._resolve_mid_premium(current_price, arcTick)
-
-        # --- SL / TP defaults ---
+        # ✅ ALWAYS defer premium fetching to pipeline (at trigger time)
+        # Premium will be fetched when trigger hits using real-time stream or snapshot retry
+        
+        # --- SL / TP defaults (using placeholders, will be recalculated with actual premium) ---
         if self._stop_loss is None:
-            self._stop_loss = round(mid_premium * 0.8, 2)
+            self._stop_loss = 0.5  # Placeholder, will be recalculated
         if self._take_profit is None:
-            self._take_profit = round(mid_premium * 1.2, 2)
+            self._take_profit = 1.2  # Placeholder, will be recalculated
 
         order = Order(
             symbol=self._symbol,
@@ -681,8 +681,8 @@ class AppModel:
             strike=self._strike,
             right=self._right,
             type=type,
-            qty=quantity,
-            entry_price=mid_premium,
+            qty=None,  # Will be calculated in _finalize_order from premium
+            entry_price=None,  # Will be calculated in _finalize_order from premium
             tp_price=self._take_profit,
             sl_price=self._stop_loss,
             action=action.upper(),
@@ -690,7 +690,14 @@ class AppModel:
         )
 
         order.set_position_size(float(position))
-        order._order_ready = True
+        order._order_ready = False  # ✅ ALWAYS False - pipeline will fetch premium
+        
+        # ✅ Store model and args for pipeline to use
+        order._model = self
+        order._args = {
+            "arcTick": arcTick,
+            "position": position
+        }
 
         cb = status_callback or self._status_callback
         if cb:

@@ -51,7 +51,13 @@ class ArcTriggerApp(tk.Tk):
         super().__init__()
         self.title("ArcTriggerPy")
         self.configure(bg="black")
-        self.iconbitmap(resource_path("icon.ico"))
+        # ✅ Make icon loading optional (won't crash if icon missing)
+        try:
+            icon_path = resource_path("icon.ico")
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+        except Exception as e:
+            logging.debug(f"Could not load icon: {e}")
         self.geometry("1400x800")  # width x height
 
         # ---------- Banner ----------
@@ -384,8 +390,22 @@ class ArcTriggerApp(tk.Tk):
 # ---------- ENTRY ----------
 if __name__ == "__main__":
     import atexit
+    import traceback
     atexit.register(lambda: os.path.exists("arctrigger.dat") or None)
 
-    setup_logging()
-    app = ArcTriggerApp()
-    app.mainloop()
+    try:
+        setup_logging()
+        logging.info("Starting ArcTrigger application...")
+        app = ArcTriggerApp()
+        logging.info("Application initialized successfully")
+        app.mainloop()
+    except Exception as e:
+        error_msg = f"Fatal error during startup: {e}\n\n{traceback.format_exc()}"
+        logging.critical(error_msg)
+        print("\n" + "="*60)
+        print("FATAL ERROR - Application failed to start")
+        print("="*60)
+        print(error_msg)
+        print("="*60)
+        input("\nPress Enter to exit...")
+        raise

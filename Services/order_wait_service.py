@@ -2,6 +2,7 @@ import threading
 import time
 import logging
 import gc
+from typing import Optional
 from Helpers.Order import Order, OrderState
 from Services.order_manager import order_manager
 from Services.watcher_info import (
@@ -32,6 +33,11 @@ class OrderWaitService:
         self._stoplosses = dict()
         # Storage for WS callbacks to allow proper unsubscription
         self._ws_callbacks = {} # Dictionary to store {order_id: callback_function}
+
+        # ✅ Premium streaming cache (real-time bid/ask ticks)
+        self._premium_streams = {}  # key: (symbol, expiry, strike, right) → stream data
+        self._premium_streams_by_req_id = {}  # req_id → stream key (for tickPrice routing)
+        self._stream_lock = threading.Lock()  # Thread-safe access to streams
 
         # Polling interval for alternate mode (seconds), optimized from 0.1s to 0.5s
         self.poll_interval = poll_interval
@@ -424,7 +430,13 @@ class OrderWaitService:
         with self.lock:
             self.pending_orders[order_id] = order
 
-        # ✅ IMMEDIATE TRIGGER CHECK
+        # ✅ START PREMIUM STREAM FIRST (before checking trigger)
+        if order.trigger:  # Only stream if order has trigger
+            self._start_premium_stream(order)
+            # Give stream a moment to start receiving ticks (100ms)
+            time.sleep(0.1)
+
+        # ✅ IMMEDIATE TRIGGER CHECK (after stream started)
         current_price = self.polygon.get_last_trade(order.symbol)
         if current_price and order.is_triggered(current_price):
             logging.info(
@@ -436,7 +448,7 @@ class OrderWaitService:
 
         # Subscribe / start poller only if trigger not already met
         self.start_trigger_watcher(order, mode) # 💡 Simplified to use the router
-
+        
         msg = (
             f"[WaitService] Order added {order_id} "
             f"(mode={mode}, waiting for trigger {order.trigger}, current: {current_price})"
@@ -484,6 +496,171 @@ class OrderWaitService:
                 logging.debug(f"[WaitService] Unsubscribe ignored for {symbol}: {e}")
         elif not callback_func:
             logging.debug(f"[WaitService] No WS callback found for order {order_id} (likely poll mode).")
+        
+        # ✅ Stop premium stream for this order
+        if order:
+            self._stop_premium_stream(order)
+
+    def _start_premium_stream(self, order: Order):
+        """Start streaming bid/ask ticks for option premium (real-time cache)"""
+        key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
+        
+        with self._stream_lock:
+            # Check if stream already exists
+            if key in self._premium_streams:
+                # Stream exists - just add this order to reference count
+                self._premium_streams[key]["order_ids"].add(order.order_id)
+                logging.debug(f"[WaitService] Reusing existing premium stream for {order.symbol} {order.expiry} {order.strike}{order.right}")
+                return
+            
+            # Need to start new stream
+            # Get conId (use cached if available)
+            conid = self.tws._pre_conid_cache.get(key)
+            if not conid:
+                # Resolve conId
+                from ibapi.contract import Contract
+                contract = self.tws.create_option_contract(
+                    order.symbol, order.expiry, order.strike, order.right
+                )
+                conid = self.tws.resolve_conid(contract, timeout=5)
+                if not conid:
+                    logging.warning(f"[WaitService] Cannot start premium stream - no conId for {order.symbol} {order.expiry} {order.strike}{order.right}")
+                    return
+                # Cache it
+                self.tws._pre_conid_cache[key] = conid
+            
+            # Create contract with conId
+            from ibapi.contract import Contract
+            contract = Contract()
+            contract.conId = conid
+            contract.symbol = order.symbol
+            contract.secType = "OPT"
+            contract.lastTradeDateOrContractMonth = order.expiry
+            contract.strike = order.strike
+            contract.right = order.right
+            contract.exchange = "SMART"
+            contract.currency = "USD"
+            
+            # Get next req_id
+            req_id = self.tws._get_next_req_id()
+            
+            # Store stream data
+            self._premium_streams[key] = {
+                "req_id": req_id,
+                "bid": None,
+                "ask": None,
+                "mid": None,
+                "last_update": 0,
+                "order_ids": {order.order_id}
+            }
+            self._premium_streams_by_req_id[req_id] = key
+            
+            # Request streaming market data (snapshot=False means continuous)
+            try:
+                self.tws.reqMktData(req_id, contract, "", False, False, [])
+                logging.info(
+                    f"[WaitService] ✅ Started premium stream for {order.symbol} {order.expiry} {order.strike}{order.right} "
+                    f"(req_id={req_id}, conId={conid})"
+                )
+            except Exception as e:
+                logging.error(f"[WaitService] Failed to start premium stream: {e}")
+                # Cleanup on error
+                del self._premium_streams[key]
+                del self._premium_streams_by_req_id[req_id]
+    
+    def _stop_premium_stream(self, order: Order):
+        """Stop premium stream when order is done (reference counting)"""
+        key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
+        
+        with self._stream_lock:
+            stream = self._premium_streams.get(key)
+            if not stream:
+                return  # Stream doesn't exist
+            
+            # Remove this order from reference count
+            stream["order_ids"].discard(order.order_id)
+            
+            # If no more orders using this stream, cancel it
+            if not stream["order_ids"]:
+                req_id = stream["req_id"]
+                try:
+                    self.tws.cancelMktData(req_id)
+                    logging.info(
+                        f"[WaitService] Stopped premium stream for {order.symbol} {order.expiry} {order.strike}{order.right} "
+                        f"(req_id={req_id})"
+                    )
+                except Exception as e:
+                    logging.warning(f"[WaitService] Error cancelling premium stream: {e}")
+                
+                # Cleanup
+                del self._premium_streams[key]
+                del self._premium_streams_by_req_id[req_id]
+    
+    def _get_streamed_premium(self, order: Order) -> Optional[float]:
+        """Get premium from active stream (0ms latency) - returns None if stream not available"""
+        key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
+        
+        with self._stream_lock:
+            stream = self._premium_streams.get(key)
+            if not stream:
+                return None  # Stream doesn't exist
+            
+            # Wait up to 200ms for stream to populate (for immediate trigger case)
+            max_wait = 0.2
+            wait_interval = 0.01
+            waited = 0
+            while waited < max_wait:
+                bid = stream.get("bid")
+                ask = stream.get("ask")
+                mid = stream.get("mid")
+                
+                # If we have mid, use it
+                if mid and mid > 0:
+                    logging.info(
+                        f"[WaitService] ✅ Premium from stream: {mid} (0ms latency) | "
+                        f"bid={bid} ask={ask}"
+                    )
+                    return mid
+                
+                # If we have bid and ask but no mid, calculate it
+                if bid and ask and bid > 0 and ask > 0:
+                    calculated_mid = (bid + ask) / 2
+                    stream["mid"] = calculated_mid
+                    stream["last_update"] = time.time()
+                    logging.info(
+                        f"[WaitService] ✅ Premium calculated from stream bid/ask: {calculated_mid} (0ms latency) | "
+                        f"bid={bid} ask={ask}"
+                    )
+                    return calculated_mid
+                
+                time.sleep(wait_interval)
+                waited += wait_interval
+            
+            # Check if stream is fresh (updated in last 5 seconds)
+            last_update = stream.get("last_update", 0)
+            if last_update < time.time() - 5:
+                logging.warning(f"[WaitService] Premium stream stale for {order.symbol} {order.expiry} {order.strike}{order.right} (last_update={last_update}, age={time.time() - last_update:.1f}s)")
+                return None
+            
+            # Final check - try to get mid or calculate from bid/ask
+            bid = stream.get("bid")
+            ask = stream.get("ask")
+            mid = stream.get("mid")
+            
+            if mid and mid > 0:
+                logging.info(f"[WaitService] ✅ Premium from stream: {mid} (0ms latency)")
+                return mid
+            
+            if bid and ask and bid > 0 and ask > 0:
+                calculated_mid = (bid + ask) / 2
+                stream["mid"] = calculated_mid
+                stream["last_update"] = time.time()
+                logging.info(f"[WaitService] ✅ Premium calculated from stream bid/ask: {calculated_mid} | bid={bid} ask={ask}")
+                return calculated_mid
+            
+            logging.debug(f"[WaitService] Stream exists but no valid price data yet for {order.symbol} | bid={bid} ask={ask} mid={mid}")
+        
+        return None
 
     def list_pending_orders(self):
         with self.lock:
@@ -929,6 +1106,8 @@ class OrderWaitService:
     def _finalize_order(self, order_id: str, order: Order, tinfo: ThreadInfo, last_price):
         """Sends the entry order to TWS and handles cleanup and status updates."""
         
+        logging.info(f"[WaitService] _finalize_order called | order_id={order_id} | entry_price={getattr(order, 'entry_price', None)} | _order_ready={getattr(order, '_order_ready', None)}")
+        
         # Ensure we're in RTH (shouldn't be called in premarket, but double-check)
         if is_market_closed_or_pre_market():
             logging.error(
@@ -936,62 +1115,72 @@ class OrderWaitService:
             )
             return
         
-        # If order not ready, fetch premium with retry logic and calculate qty/entry_price
-        if not getattr(order, "_order_ready", False):
-            logging.info(f"[WaitService] Order not ready - fetching premium with retry | order_id={order_id}")
+        # ✅ FIX: Check if entry_price needs to be calculated (even if _order_ready=True)
+        # OrderFixerService may have set _order_ready=True but didn't set entry_price
+        if not order.entry_price or order.entry_price <= 0:
+            logging.info(f"[WaitService] entry_price not set - calculating from premium | order_id={order_id}")
             
             # Get model and args
             model = getattr(order, "_model", None)
-            if not model:
-                logging.error(f"[WaitService] No model found for order {order_id}")
-                order.mark_failed("No model found for order")
-                return
-            
             _args = getattr(order, "_args", {})
             arcTick = _args.get("arcTick", 0.01)
             position_size = getattr(order, "_position_size", _args.get("position", 2000))
             
-            # Fetch premium with retry logic (4 attempts, 500ms delay)
-            premium = None
-            max_attempts = 4
-            retry_delay = 0.5  # 500ms
+            # Try to get premium from order.premium (set by OrderFixerService)
+            premium = getattr(order, "premium", None)
             
-            from model import general_app
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    logging.info(
-                        f"[WaitService] Premium fetch attempt {attempt}/{max_attempts} | "
-                        f"order_id={order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
-                    )
-                    premium = general_app.get_option_premium(
-                        order.symbol, order.expiry, order.strike, order.right
-                    )
-                    
-                    if premium and premium > 0:
-                        logging.info(
-                            f"[WaitService] ✅ Premium fetched successfully | "
-                            f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                        )
-                        break
-                    else:
-                        logging.warning(
-                            f"[WaitService] Premium fetch returned invalid value | "
-                            f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                        )
-                except Exception as e:
-                    logging.warning(
-                        f"[WaitService] Premium fetch attempt {attempt} failed | "
-                        f"order_id={order_id} | error={e}"
-                    )
-                
-                if attempt < max_attempts:
-                    time.sleep(retry_delay)
-            
+            # If no premium, try stream first
             if not premium or premium <= 0:
-                error_msg = f"Failed to fetch premium after {max_attempts} attempts"
-                logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
-                order.mark_failed(error_msg)
-                return
+                premium = self._get_streamed_premium(order)
+            
+            # If still no premium, fetch with retry
+            if not premium or premium <= 0:
+                logging.info(f"[WaitService] Premium not available, fetching with retry | order_id={order_id}")
+                max_attempts = 4
+                retry_delay = 0.5
+                
+                from model import general_app
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        logging.info(
+                            f"[WaitService] Premium fetch attempt {attempt}/{max_attempts} | "
+                            f"order_id={order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
+                        )
+                        premium = general_app.get_option_premium(
+                            order.symbol, order.expiry, order.strike, order.right
+                        )
+                        
+                        if premium and premium > 0:
+                            logging.info(
+                                f"[WaitService] ✅ Premium fetched successfully | "
+                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
+                            )
+                            break
+                        else:
+                            logging.warning(
+                                f"[WaitService] Premium fetch returned invalid value | "
+                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
+                            )
+                    except Exception as e:
+                        logging.warning(
+                            f"[WaitService] Premium fetch attempt {attempt} failed | "
+                            f"order_id={order_id} | error={e}"
+                        )
+                    
+                    if attempt < max_attempts:
+                        time.sleep(retry_delay)
+                
+                if not premium or premium <= 0:
+                    error_msg = f"Failed to fetch premium after {max_attempts} attempts"
+                    logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
+                    order.mark_failed(error_msg)
+                    return
+            
+            # ✅ Recalculate SL/TP based on actual premium (if they were placeholders)
+            if order.sl_price == 0.5 or order.tp_price == 1.2:  # Placeholder values
+                order.sl_price = round(premium * 0.8, 2)
+                order.tp_price = round(premium * 1.2, 2)
+                logging.debug(f"[WaitService] Recalculated SL/TP: SL={order.sl_price} TP={order.tp_price} from premium={premium}")
             
             # Calculate entry_price from premium + arcTick
             mid = premium + arcTick
@@ -1004,34 +1193,33 @@ class OrderWaitService:
             
             entry_price = round(int(mid / tick) * tick, 2)
             
-            # Calculate quantity from position_size and premium
-            qty = int(position_size // premium) if premium > 0 else 1
-            if qty <= 0:
-                qty = 1
-                logging.warning(
-                    f"[WaitService] Calculated qty was <= 0, using qty=1 | "
-                    f"order_id={order_id} | position_size={position_size} | premium={premium}"
-                )
-            
             # Update order with calculated values
             order.entry_price = entry_price
-            order.qty = qty
             
-            # Set SL/TP if not already set
-            if not order.sl_price and model._stop_loss:
-                order.sl_price = model._stop_loss
-            elif not order.sl_price:
-                order.sl_price = round(entry_price * 0.8, 2)
+            # Update qty if not set (should be set by OrderFixerService, but just in case)
+            if not order.qty or order.qty <= 0:
+                qty = int(position_size // premium) if premium > 0 else 1
+                if qty <= 0:
+                    qty = 1
+                order.qty = qty
+                logging.info(f"[WaitService] Calculated qty={qty} from premium={premium} | order_id={order_id}")
             
-            if not order.tp_price and model._take_profit:
-                order.tp_price = model._take_profit
-            elif not order.tp_price:
-                order.tp_price = round(entry_price * 1.2, 2)
+            # Set SL/TP if not already set (fallback to model defaults)
+            if not order.sl_price:
+                if model and hasattr(model, "_stop_loss") and model._stop_loss:
+                    order.sl_price = model._stop_loss
+                else:
+                    order.sl_price = round(entry_price * 0.8, 2)
             
-            order._order_ready = True
+            if not order.tp_price:
+                if model and hasattr(model, "_take_profit") and model._take_profit:
+                    order.tp_price = model._take_profit
+                else:
+                    order.tp_price = round(entry_price * 1.2, 2)
+            
             logging.info(
                 f"[WaitService] Order prepared with premium pipeline | order_id={order_id} | "
-                f"premium={premium} | entry_price={entry_price} | qty={qty} | position_size={position_size}"
+                f"premium={premium} | entry_price={entry_price} | qty={order.qty}"
             )
         
         # Helper to update tinfo if it exists (for poll mode)
@@ -1042,10 +1230,18 @@ class OrderWaitService:
                 active_tinfo.update_status(status, last_price=last_price, **kwargs)
 
 
+        # ✅ FINAL SAFETY CHECK: Ensure entry_price is set before placing order
+        if not order.entry_price or order.entry_price <= 0:
+            error_msg = f"Order {order_id} entry_price is not set ({order.entry_price}). Cannot place order."
+            logging.error(f"[WaitService] {error_msg}")
+            order.mark_failed(error_msg)
+            _update_tinfo_status(STATUS_FAILED, info={"error": error_msg})
+            return
+        
         try:
             start_ts = time.time() * 1000
             logging.info(f"[TWS-LATENCY] {order.symbol} Trigger hit → sending ENTRY order "
-                        f"({order.right}{order.strike}) at {start_ts:.0f} ms")
+                        f"({order.right}{order.strike}) at {start_ts:.0f} ms | entry_price={order.entry_price} | qty={order.qty}")
             success = self.tws.place_custom_order(order)
             if success:
                 end_ts = time.time() * 1000

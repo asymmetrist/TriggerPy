@@ -45,6 +45,10 @@ class TWSService(EWrapper, EClient):
         self._positions_by_order_id: dict[str, dict] = {}
         self._ib_to_order_id: dict[int, str] = {}
         self._ib_to_custom_id: dict[int, str] = {}   # <-- NEW: map IB orderId -> custom UUID
+        
+        # ✅ Temporary tickPrice callbacks for snapshot requests
+        self._temporary_tick_callbacks = {}  # req_id → callback function
+        
         logging.info("[TWSService] __init__ finished – empty caches, counters reset")
 
     def conn_status(self) -> bool:
@@ -153,6 +157,57 @@ class TWSService(EWrapper, EClient):
         logging.info(f"[TWSService] search_symbol() returning {len(out)} matches")
         return out
 
+    def tickPrice(self, reqId, tickType, price, attrib):
+        """
+        Handle tick price updates from TWS.
+        Routes to: 1) Premium streams (real-time), 2) Temporary snapshot callbacks
+        """
+        if price <= 0:
+            return
+        
+        # ✅ FIRST: Check if this is a premium stream request
+        # Use a safer import that won't cause circular dependency issues
+        try:
+            import sys
+            if 'Services.order_wait_service' in sys.modules:
+                wait_service = sys.modules['Services.order_wait_service'].wait_service
+                if hasattr(wait_service, '_premium_streams_by_req_id'):
+                    stream_key = wait_service._premium_streams_by_req_id.get(reqId)
+                    if stream_key:
+                        # This is a streaming request - update stream
+                        with wait_service._stream_lock:
+                            stream = wait_service._premium_streams.get(stream_key)
+                            if stream:
+                                if tickType == 1:  # BID
+                                    stream["bid"] = price
+                                    logging.info(f"[TWSService] ✅ Stream BID update: reqId={reqId} price={price}")
+                                elif tickType == 2:  # ASK
+                                    stream["ask"] = price
+                                    logging.info(f"[TWSService] ✅ Stream ASK update: reqId={reqId} price={price}")
+                                
+                                # Calculate mid when both available
+                                bid = stream.get("bid")
+                                ask = stream.get("ask")
+                                if bid is not None and ask is not None and bid > 0 and ask > 0:
+                                    stream["mid"] = (bid + ask) / 2
+                                    stream["last_update"] = time.time()
+                                    logging.info(f"[TWSService] ✅ Stream MID calculated: reqId={reqId} bid={bid} ask={ask} mid={stream['mid']}")
+                        return  # Handled by stream
+        except (ImportError, AttributeError, KeyError) as e:
+            # Log error for debugging
+            logging.debug(f"[TWSService] Error checking premium stream: {e}")
+        
+        # ✅ SECOND: Check if this is a temporary snapshot callback
+        callback = self._temporary_tick_callbacks.get(reqId)
+        if callback:
+            try:
+                callback(reqId, tickType, price, attrib)
+            except Exception as e:
+                logging.warning(f"[TWSService] Error in temporary tick callback: {e}")
+            return  # Handled by snapshot
+        
+        # No handler - ignore (might be other market data subscriptions)
+    
     def error(self, reqId, errorCode, errorString, *args):
         """Error callback - handles both regular and protobuf errors"""
         logging.info(f"[TWSService] error() fired – reqId={reqId} code={errorCode} msg={errorString}")
@@ -608,7 +663,7 @@ class TWSService(EWrapper, EClient):
         result = {"bid": None, "ask": None, "last": None, "mid": None}
         event = threading.Event()
 
-        def tickPrice(reqId, tickType, price, attrib):
+        def tickPrice_callback(reqId, tickType, price, attrib):
             if reqId != req_id or price <= 0:
                 return
             if tickType == 1:
@@ -621,8 +676,8 @@ class TWSService(EWrapper, EClient):
                 result["mid"] = (result["bid"] + result["ask"]) / 2
                 event.set()
 
-        original_tick = self.tickPrice
-        self.tickPrice = tickPrice
+        # ✅ Use temporary callback dict instead of overriding tickPrice
+        self._temporary_tick_callbacks[req_id] = tickPrice_callback
 
         try:
             self.reqMktData(req_id, contract, "", True, False, [])
@@ -646,7 +701,8 @@ class TWSService(EWrapper, EClient):
                 self.cancelMktData(req_id)
             except Exception:
                 pass
-            self.tickPrice = original_tick
+            # ✅ Cleanup temporary callback
+            self._temporary_tick_callbacks.pop(req_id, None)
 
     def pre_conid(self, custom_order: Order) -> bool:
         """
@@ -763,6 +819,12 @@ class TWSService(EWrapper, EClient):
                 #raise RuntimeError(f"No live premium for {custom_order.symbol} {custom_order.expiry} {custom_order.strike}{ib_right}")
 
             base_price = custom_order.entry_price #or premium
+            
+            # ✅ SAFETY CHECK: Ensure entry_price is set
+            if base_price is None or base_price <= 0:
+                error_msg = f"Order {custom_order.order_id} has invalid entry_price: {base_price}. Order must be finalized first."
+                logging.error(f"[TWSService] {error_msg}")
+                raise ValueError(error_msg)
 
             # ✅ FIXED QTY CALC
             if getattr(custom_order, "_position_size", None):
@@ -1038,7 +1100,7 @@ class TWSService(EWrapper, EClient):
         tick_snapshot = {"bid": None, "ask": None}
         event = threading.Event()
 
-        def tickPrice(reqId, tickType, price, attrib):
+        def tickPrice_callback(reqId, tickType, price, attrib):
             if reqId != req_id or price <= 0:
                 return
             if tickType == 1:
@@ -1048,8 +1110,8 @@ class TWSService(EWrapper, EClient):
             if tick_snapshot["bid"] is not None and tick_snapshot["ask"] is not None:
                 event.set()
 
-        original_tick = self.tickPrice
-        self.tickPrice = tickPrice
+        # ✅ Use temporary callback dict instead of overriding tickPrice
+        self._temporary_tick_callbacks[req_id] = tickPrice_callback
 
         try:
             self.reqMktData(req_id, contract, "", True, False, [])
@@ -1069,7 +1131,8 @@ class TWSService(EWrapper, EClient):
                 self.cancelMktData(req_id)
             except Exception:
                 pass
-            self.tickPrice = original_tick
+            # ✅ Cleanup temporary callback
+            self._temporary_tick_callbacks.pop(req_id, None)
 
 service = TWSService()
 logging.info("[TWSService] module-level service instance created")
