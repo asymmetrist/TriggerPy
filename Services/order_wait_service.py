@@ -936,34 +936,103 @@ class OrderWaitService:
             )
             return
         
-        # If order not ready, prepare it now (fetch price, calculate quantity)
+        # If order not ready, fetch premium with retry logic and calculate qty/entry_price
         if not getattr(order, "_order_ready", False):
-            logging.info(f"[WaitService] Order not ready - preparing now | order_id={order_id}")
+            logging.info(f"[WaitService] Order not ready - fetching premium with retry | order_id={order_id}")
+            
+            # Get model and args
             model = getattr(order, "_model", None)
-            if model and hasattr(order, "_args"):
+            if not model:
+                logging.error(f"[WaitService] No model found for order {order_id}")
+                order.mark_failed("No model found for order")
+                return
+            
+            _args = getattr(order, "_args", {})
+            arcTick = _args.get("arcTick", 0.01)
+            position_size = getattr(order, "_position_size", _args.get("position", 2000))
+            
+            # Fetch premium with retry logic (4 attempts, 500ms delay)
+            premium = None
+            max_attempts = 4
+            retry_delay = 0.5  # 500ms
+            
+            from model import general_app
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    _args = order._args
-                    prepared_order = model.prepare_option_order(
-                        action=_args.get("action", "BUY"),
-                        position=_args.get("position", 2000),
-                        quantity=_args.get("quantity", 1),
-                        trigger_price=_args.get("trigger_price"),
-                        arcTick=_args.get("arcTick", 0.01),
-                        type=_args.get("type", "LMT"),
-                        status_callback=_args.get("status_callback")
-                    )
-                    # Update order with prepared values
-                    order.entry_price = prepared_order.entry_price
-                    order.qty = prepared_order.qty
-                    order._order_ready = True
                     logging.info(
-                        f"[WaitService] Order prepared | order_id={order_id} | "
-                        f"price={order.entry_price} | qty={order.qty}"
+                        f"[WaitService] Premium fetch attempt {attempt}/{max_attempts} | "
+                        f"order_id={order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
                     )
+                    premium = general_app.get_option_premium(
+                        order.symbol, order.expiry, order.strike, order.right
+                    )
+                    
+                    if premium and premium > 0:
+                        logging.info(
+                            f"[WaitService] ✅ Premium fetched successfully | "
+                            f"order_id={order_id} | premium={premium} | attempt={attempt}"
+                        )
+                        break
+                    else:
+                        logging.warning(
+                            f"[WaitService] Premium fetch returned invalid value | "
+                            f"order_id={order_id} | premium={premium} | attempt={attempt}"
+                        )
                 except Exception as e:
-                    logging.error(f"[WaitService] Failed to prepare order: {e}")
-                    order.mark_failed(f"Preparation failed: {e}")
-                    return
+                    logging.warning(
+                        f"[WaitService] Premium fetch attempt {attempt} failed | "
+                        f"order_id={order_id} | error={e}"
+                    )
+                
+                if attempt < max_attempts:
+                    time.sleep(retry_delay)
+            
+            if not premium or premium <= 0:
+                error_msg = f"Failed to fetch premium after {max_attempts} attempts"
+                logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
+                order.mark_failed(error_msg)
+                return
+            
+            # Calculate entry_price from premium + arcTick
+            mid = premium + arcTick
+            if mid < 3:
+                tick = 0.01
+            elif mid >= 5:
+                tick = 0.15
+            else:
+                tick = 0.05
+            
+            entry_price = round(int(mid / tick) * tick, 2)
+            
+            # Calculate quantity from position_size and premium
+            qty = int(position_size // premium) if premium > 0 else 1
+            if qty <= 0:
+                qty = 1
+                logging.warning(
+                    f"[WaitService] Calculated qty was <= 0, using qty=1 | "
+                    f"order_id={order_id} | position_size={position_size} | premium={premium}"
+                )
+            
+            # Update order with calculated values
+            order.entry_price = entry_price
+            order.qty = qty
+            
+            # Set SL/TP if not already set
+            if not order.sl_price and model._stop_loss:
+                order.sl_price = model._stop_loss
+            elif not order.sl_price:
+                order.sl_price = round(entry_price * 0.8, 2)
+            
+            if not order.tp_price and model._take_profit:
+                order.tp_price = model._take_profit
+            elif not order.tp_price:
+                order.tp_price = round(entry_price * 1.2, 2)
+            
+            order._order_ready = True
+            logging.info(
+                f"[WaitService] Order prepared with premium pipeline | order_id={order_id} | "
+                f"premium={premium} | entry_price={entry_price} | qty={qty} | position_size={position_size}"
+            )
         
         # Helper to update tinfo if it exists (for poll mode)
         def _update_tinfo_status(status, **kwargs):

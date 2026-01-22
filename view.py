@@ -18,7 +18,7 @@ class Banner(tk.Canvas):
         self.create_text(20, 30, anchor="w", text="ARCTRIGGER",
                          font=("Arial Black", 24, "bold"), fill="#A020F0")
         # Version number
-        self.create_text(220, 30, anchor="w", text="MV 1.0",
+        self.create_text(220, 30, anchor="w", text="MV 1.1",
                          font=("Arial", 12, "bold"), fill="#00FF00")
 
         self.connection_status = self.create_text(
