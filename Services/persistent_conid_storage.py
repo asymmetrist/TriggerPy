@@ -39,6 +39,16 @@ class PersistentConidStorage:
                 )
                 """
             )
+            # Symbol search cache table
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS symbol_search_cache (
+                    query TEXT PRIMARY KEY,
+                    results TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def store_conid(self, symbol: str, conid: str) -> None:
@@ -172,6 +182,46 @@ class PersistentConidStorage:
                     (symbol.upper(),),
                 )
             conn.commit()
+
+    # ========== Symbol Search Cache Methods ==========
+    
+    def store_symbol_search(self, query: str, results: list) -> None:
+        """
+        Cache symbol search results.
+        query: Search query (e.g., "AAP")
+        results: List of symbol dicts from TWS
+        """
+        import json
+        now = datetime.utcnow().isoformat()
+        with self._get_conn() as conn:
+            results_json = json.dumps(results)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO symbol_search_cache (query, results, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (query.upper(), results_json, now)
+            )
+            conn.commit()
+
+    def get_symbol_search(self, query: str) -> Optional[list]:
+        """
+        Get cached symbol search results.
+        Returns None if not cached or cache is stale (>24 hours).
+        """
+        import json
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                """
+                SELECT results FROM symbol_search_cache
+                WHERE query = ? AND datetime(updated_at) > datetime('now', '-24 hours')
+                """,
+                (query.upper(),)
+            )
+            row = cur.fetchone()
+            if row:
+                return json.loads(row[0])
+        return None
 
 
 # Example usage:

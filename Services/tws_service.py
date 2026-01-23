@@ -147,14 +147,44 @@ class TWSService(EWrapper, EClient):
         logging.info(f"[TWSService] symbolSamples finished – stored {len(results)} rows")
 
     def search_symbol(self, name: str, reqId: int = None):
+        """
+        Search for symbols matching a pattern.
+        Hybrid approach: Check cache first, then fetch from TWS.
+        """
         logging.info(f"[TWSService] search_symbol() called – name={name}")
+        
+        # ✅ Step 1: Check cache first (instant, 0ms)
+        cached_results = storage.get_symbol_search(name)
+        if cached_results:
+            logging.info(f"[TWSService] ✅ Using cached symbol search for '{name}' ({len(cached_results)} results, 0ms)")
+            # Still fetch fresh in background to update cache
+            def fetch_fresh():
+                try:
+                    fresh_results = self._fetch_symbols_from_tws(name, reqId)
+                    if fresh_results:
+                        storage.store_symbol_search(name, fresh_results)
+                except Exception as e:
+                    logging.debug(f"[TWSService] Background refresh failed for '{name}': {e}")
+            threading.Thread(target=fetch_fresh, daemon=True).start()
+            return cached_results
+        
+        # ✅ Step 2: No cache - fetch from TWS (normal flow)
+        return self._fetch_symbols_from_tws(name, reqId)
+    
+    def _fetch_symbols_from_tws(self, name: str, reqId: int = None) -> list:
+        """Internal method to fetch symbols from TWS"""
         if reqId is None:
             reqId = self._get_next_req_id()
             logging.info(f"[TWSService] search_symbol() auto-selected reqId={reqId}")
         self.reqMatchingSymbols(reqId, name)
         time.sleep(2)
         out = self.symbol_samples.get(reqId, [])
+        if reqId in self.symbol_samples:
+            del self.symbol_samples[reqId]
         logging.info(f"[TWSService] search_symbol() returning {len(out)} matches")
+        # Cache the results
+        if out:
+            storage.store_symbol_search(name, out)
         return out
 
     def tickPrice(self, reqId, tickType, price, attrib):
@@ -509,16 +539,29 @@ class TWSService(EWrapper, EClient):
         """Resolve contract to conId"""
         logging.info(f"[TWSService] resolve_conid() – contract={contract.symbol} secType={getattr(contract, 'secType', '?')}")
         
-        # ✅ FIX: Only use cached conId for STOCK contracts
-        # OPTION contracts have different conIds - must resolve fresh
-        # The cache (work_symbols) only stores underlying STOCK conIds
+        # Check cache for STOCK contracts
         if contract.secType == "STK":
             conid = storage.get_conid(contract.symbol) 
             if conid != None:
                 logging.info(f"[TWSService] using stored STOCK conid at resolve_conid({contract.symbol})")
                 return int(conid)
         
-        # For OPTION contracts or if no cache, resolve fresh
+        # ✅ NEW: Check cache for OPTION contracts (hybrid approach)
+        if contract.secType == "OPT":
+            expiry = getattr(contract, 'lastTradeDateOrContractMonth', None)
+            strike = getattr(contract, 'strike', None)
+            right = getattr(contract, 'right', None)
+            if expiry and strike is not None and right:
+                cached_conid = storage.get_option_conid(
+                    contract.symbol, expiry, float(strike), right
+                )
+                if cached_conid:
+                    logging.info(f"[TWSService] ✅ Using cached OPTION conid for {contract.symbol} {expiry} {strike}{right} → {cached_conid} (0ms)")
+                    return int(cached_conid)
+                else:
+                    logging.debug(f"[TWSService] No cached OPTION conid for {contract.symbol} {expiry} {strike}{right}, resolving from TWS")
+        
+        # For contracts not in cache, resolve fresh from TWS
         if not self.is_connected():
             return None
 
