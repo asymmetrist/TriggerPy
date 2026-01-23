@@ -88,15 +88,19 @@ class OrderQueueService:
     def rebase_queued_premarket_order(self, order: Order, new_trigger: float) -> bool:
         """
         Rebase trigger price of a queued premarket ORDER.
+        Checks both order_queue and wait_service pending orders.
         """
+        order_id = getattr(order, 'order_id', None)
+        
+        # 1. Check order_queue (for orders queued but not yet in wait service)
         with self._lock:
             for queued_order in self._queued_orders:
-                if queued_order is order:
+                if queued_order is order or (order_id and getattr(queued_order, 'order_id', None) == order_id):
                     queued_order.trigger = new_trigger
 
                     logging.info(
                         f"[OrderQueueService] Rebased queued order "
-                        f"{order.order_id} → trigger {new_trigger}"
+                        f"{order_id} → trigger {new_trigger}"
                     )
 
                     cb = getattr(order, "_status_callback", None)
@@ -108,9 +112,39 @@ class OrderQueueService:
 
                     return True
 
+        # 2. Check wait_service pending_orders (for orders actively being watched)
+        # Use lazy import to avoid circular dependency
+        try:
+            from model import general_app
+            wait_service = getattr(general_app, 'order_wait', None)
+        except (ImportError, AttributeError):
+            wait_service = None
+            
+        if wait_service and order_id:
+            with wait_service.lock:
+                pending_order = wait_service.pending_orders.get(order_id)
+                if pending_order:
+                    pending_order.trigger = new_trigger
+                    # Also update the order reference in model
+                    order.trigger = new_trigger
+                    
+                    logging.info(
+                        f"[OrderQueueService] Rebased pending order in wait service "
+                        f"{order_id} → trigger {new_trigger}"
+                    )
+
+                    cb = getattr(order, "_status_callback", None)
+                    if cb:
+                        cb(
+                            f"Order rebased to trigger {new_trigger:.2f}",
+                            "blue"
+                        )
+
+                    return True
+
         logging.warning(
-            f"[OrderQueueService] No queued order found to rebase "
-            f"(order_id={getattr(order, 'order_id', 'UNKNOWN')})"
+            f"[OrderQueueService] No queued or pending order found to rebase "
+            f"(order_id={order_id})"
         )
         return False
 

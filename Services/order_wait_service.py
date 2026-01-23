@@ -1,7 +1,6 @@
 import threading
 import time
 import logging
-import gc
 from typing import Optional
 from Helpers.Order import Order, OrderState
 from Services.order_manager import order_manager
@@ -909,16 +908,21 @@ class OrderWaitService:
         widget = None
         try:
             import main
-            app = None
-            # Try to get the main app instance
-            logging.info(f"[WaitService] Searching for ArcTriggerApp instance...")
-            for obj in gc.get_objects():
-                if isinstance(obj, main.ArcTriggerApp):
-                    app = obj
-                    logging.info(f"[WaitService] ✅ Found ArcTriggerApp instance: {app}")
-                    break
+            import sys
+            # Use global reference instead of unreliable gc.get_objects()
+            logging.info(f"[WaitService] Attempting to get app instance via main.get_app_instance()...")
+            logging.info(f"[WaitService] main module: {main}, main._app_instance: {getattr(main, '_app_instance', 'NOT_FOUND')}")
+            app = main.get_app_instance()
+            logging.info(f"[WaitService] get_app_instance() returned: {app} (type: {type(app)})")
+            
+            # Fallback: try to get it directly from the module
+            if not app:
+                logging.warning(f"[WaitService] get_app_instance() returned None, trying direct access...")
+                app = getattr(main, '_app_instance', None)
+                logging.info(f"[WaitService] Direct access to _app_instance: {app}")
             
             if app:
+                logging.info(f"[WaitService] ✅ Found ArcTriggerApp instance: {app}")
                 logging.info(f"[WaitService] Checking {len(app.order_frames)} order frames for matching model")
                 # Find OrderFrame with matching model
                 for idx, frame in enumerate(app.order_frames):
@@ -935,7 +939,7 @@ class OrderWaitService:
                 if not widget:
                     logging.warning(f"[WaitService] ❌ No matching widget found in {len(app.order_frames)} frames for model {model.symbol}")
             else:
-                logging.warning(f"[WaitService] ❌ No ArcTriggerApp instance found in gc.get_objects()")
+                logging.warning(f"[WaitService] ❌ ArcTriggerApp instance is None (app not initialized yet)")
         except Exception as e:
             logging.error(f"[WaitService] ❌ Exception finding widget for popup: {e}", exc_info=True)
         

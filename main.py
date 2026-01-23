@@ -18,6 +18,13 @@ from work_symbols_view import WorkSymbolsView
 
 AUTO_SAVE_INTERVAL_MIN = 5
 
+# Global reference to app instance for popup dialogs
+_app_instance = None
+
+def get_app_instance():
+    """Get the global ArcTriggerApp instance."""
+    return _app_instance
+
 
 
 def resource_path(relative_path):
@@ -58,6 +65,10 @@ class ArcTriggerApp(tk.Tk):
                 self.iconbitmap(icon_path)
         except Exception as e:
             logging.debug(f"Could not load icon: {e}")
+        # Set global app instance immediately when app is created
+        global _app_instance
+        _app_instance = self
+        logging.info(f"[ArcTriggerApp.__init__] Global app instance set: {_app_instance} (type: {type(_app_instance)})")
         self.geometry("1400x800")  # width x height
 
         # ---------- Banner ----------
@@ -393,6 +404,7 @@ if __name__ == "__main__":
     import traceback
     atexit.register(lambda: os.path.exists("arctrigger.dat") or None)
 
+<<<<<<< HEAD
     try:
         setup_logging()
         logging.info("Starting ArcTrigger application...")
@@ -409,3 +421,12 @@ if __name__ == "__main__":
         print("="*60)
         input("\nPress Enter to exit...")
         raise
+=======
+    setup_logging()
+    app = ArcTriggerApp()
+    # Store global reference for popup dialogs (module-level variable)
+    _app_instance = app
+    logging.info(f"[main] Global app instance set: {_app_instance} (type: {type(_app_instance)})")
+    logging.info(f"[main] get_app_instance() test: {get_app_instance()}")
+    app.mainloop()
+>>>>>>> feature/premarket-rebasing
