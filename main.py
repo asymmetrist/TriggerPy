@@ -404,11 +404,11 @@ if __name__ == "__main__":
     import traceback
     atexit.register(lambda: os.path.exists("arctrigger.dat") or None)
 
-<<<<<<< HEAD
     try:
         setup_logging()
         logging.info("Starting ArcTrigger application...")
         app = ArcTriggerApp()
+        # _app_instance is already set in ArcTriggerApp.__init__()
         logging.info("Application initialized successfully")
         app.mainloop()
     except Exception as e:
@@ -421,12 +421,3 @@ if __name__ == "__main__":
         print("="*60)
         input("\nPress Enter to exit...")
         raise
-=======
-    setup_logging()
-    app = ArcTriggerApp()
-    # Store global reference for popup dialogs (module-level variable)
-    _app_instance = app
-    logging.info(f"[main] Global app instance set: {_app_instance} (type: {type(_app_instance)})")
-    logging.info(f"[main] get_app_instance() test: {get_app_instance()}")
-    app.mainloop()
->>>>>>> feature/premarket-rebasing
