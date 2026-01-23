@@ -1169,45 +1169,26 @@ class OrderWaitService:
             if not premium or premium <= 0:
                 premium = self.get_streamed_premium(order)
             
-            # If still no premium, fetch with retry
+            # If still no premium, wait for stream (no snapshot fallback)
             if not premium or premium <= 0:
-                logging.info(f"[WaitService] Premium not available, fetching with retry | order_id={order_id}")
-                max_attempts = 4
-                retry_delay = 0.5
+                logging.info(f"[WaitService] Premium not available from stream, waiting... | order_id={order_id}")
+                max_wait = 1.0  # Wait up to 1 second for stream
+                wait_interval = 0.05
+                waited = 0
                 
-                from model import general_app
-                for attempt in range(1, max_attempts + 1):
-                    try:
+                while waited < max_wait:
+                    premium = self.get_streamed_premium(order)
+                    if premium and premium > 0:
                         logging.info(
-                            f"[WaitService] Premium fetch attempt {attempt}/{max_attempts} | "
-                            f"order_id={order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
+                            f"[WaitService] ✅ Premium received from stream after {waited:.2f}s | "
+                            f"order_id={order_id} | premium={premium}"
                         )
-                        premium = general_app.get_option_premium(
-                            order.symbol, order.expiry, order.strike, order.right
-                        )
-                        
-                        if premium and premium > 0:
-                            logging.info(
-                                f"[WaitService] ✅ Premium fetched successfully | "
-                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                            )
-                            break
-                        else:
-                            logging.warning(
-                                f"[WaitService] Premium fetch returned invalid value | "
-                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                            )
-                    except Exception as e:
-                        logging.warning(
-                            f"[WaitService] Premium fetch attempt {attempt} failed | "
-                            f"order_id={order_id} | error={e}"
-                        )
-                    
-                    if attempt < max_attempts:
-                        time.sleep(retry_delay)
+                        break
+                    time.sleep(wait_interval)
+                    waited += wait_interval
                 
                 if not premium or premium <= 0:
-                    error_msg = f"Failed to fetch premium after {max_attempts} attempts"
+                    error_msg = f"Streamed premium not available after {max_wait}s wait"
                     logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
                     order.mark_failed(error_msg)
                     return
