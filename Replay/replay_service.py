@@ -11,6 +11,21 @@ from Replay.historical_data_service import HistoricalDataService
 from Replay.time_mock import ReplayTimeContext
 from Services.callback_manager import callback_manager
 
+# Global instance tracker for replay service
+_replay_service_instance: Optional['ReplayService'] = None
+
+def set_replay_service(service: Optional['ReplayService']):
+    """Set the global replay service instance."""
+    global _replay_service_instance
+    _replay_service_instance = service
+
+def get_replay_price(symbol: str) -> Optional[float]:
+    """Get last replayed price if replay is active, None otherwise."""
+    global _replay_service_instance
+    if _replay_service_instance and _replay_service_instance.is_replaying:
+        return _replay_service_instance.get_last_replayed_price(symbol)
+    return None
+
 
 class ReplayService:
     """
@@ -107,6 +122,10 @@ class ReplayService:
         if self.time_context:
             self.time_context.__exit__(None, None, None)
             self.time_context = None
+        
+        # Clear replayed prices
+        with self._price_lock:
+            self._last_replayed_prices.clear()
         
         logging.info("[ReplayService] ✅ Replay stopped")
     
@@ -229,3 +248,10 @@ class ReplayService:
             "speed": self.speed_multiplier,
             "current_time": self.time_context.get_simulated_time() if self.time_context else None
         }
+    
+    def get_last_replayed_price(self, symbol: str) -> Optional[float]:
+        """Get the last replayed price for a symbol (None if not in replay or symbol not found)."""
+        if not self.is_replaying:
+            return None
+        with self._price_lock:
+            return self._last_replayed_prices.get(symbol.upper())
