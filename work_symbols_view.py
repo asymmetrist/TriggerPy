@@ -62,7 +62,7 @@ class WorkSymbolsView(tk.Toplevel):
         header_row.pack(fill="x", pady=(0, 5))
         ttk.Label(header_row, text="Symbol", font=("Arial", 9, "bold"), width=15).pack(side="left", padx=5)
         ttk.Label(header_row, text="Status", font=("Arial", 9, "bold"), width=10).pack(side="left", padx=5)
-        ttk.Label(header_row, text="Action", font=("Arial", 9, "bold"), width=10).pack(side="left", padx=5)
+        ttk.Label(header_row, text="Action", font=("Arial", 9, "bold"), width=20).pack(side="left", padx=5)
 
         # Bottom buttons
         bottom = ttk.Frame(self)
@@ -85,8 +85,18 @@ class WorkSymbolsView(tk.Toplevel):
         status_label = ttk.Label(row_frame, text="", width=10)
         status_label.pack(side="left", padx=5)
         
-        delete_btn = ttk.Button(row_frame, text="✕", width=3, command=lambda: self._remove_row(row_frame))
-        delete_btn.pack(side="left", padx=5)
+        # Action buttons frame
+        action_frame = ttk.Frame(row_frame)
+        action_frame.pack(side="left", padx=5)
+        
+        refresh_btn = None
+        if symbol:
+            # Only show refresh button for existing symbols
+            refresh_btn = ttk.Button(action_frame, text="🔄", width=3, command=lambda: self._refresh_symbol_conid(symbol, row_frame))
+            refresh_btn.pack(side="left", padx=2)
+        
+        delete_btn = ttk.Button(action_frame, text="✕", width=3, command=lambda: self._remove_row(row_frame))
+        delete_btn.pack(side="left", padx=2)
         
         if symbol:
             entry.insert(0, symbol)
@@ -99,7 +109,7 @@ class WorkSymbolsView(tk.Toplevel):
             entry.bind("<Return>", lambda e: self._on_entry_enter(entry, row_frame))
             entry.bind("<FocusOut>", lambda e: self._on_entry_focus_out(e, entry, row_frame))
         
-        self.entry_rows.append((entry, status_label, delete_btn, symbol if symbol else None, row_frame))
+        self.entry_rows.append((entry, status_label, delete_btn, refresh_btn, symbol if symbol else None, row_frame))
         return row_frame
     
     def _on_entry_enter(self, entry, row_frame):
@@ -108,24 +118,55 @@ class WorkSymbolsView(tk.Toplevel):
         if not symbol:
             return
         
-        # Add symbol to work_symbols
+        # Add symbol to work_symbols (this persists it)
         self.work_symbols.add_symbol(symbol)
+        
+        # Find the row index
+        idx = None
+        for i, (e, _, _, _, _, rf) in enumerate(self.entry_rows):
+            if e == entry and rf == row_frame:
+                idx = i
+                break
+        
+        if idx is None:
+            return
         
         # Update this row to show the symbol (make it read-only)
         entry.config(state="readonly")
         entry.unbind("<Return>")
         entry.unbind("<FocusOut>")
-        status = "❌"  # New symbol, conID not ready yet
-        idx = next(i for i, (e, _, _, _, _) in enumerate(self.entry_rows) if e == entry)
-        self.entry_rows[idx] = (entry, self.entry_rows[idx][1], self.entry_rows[idx][2], symbol, row_frame)
-        self.entry_rows[idx][1].config(text=status)
+        
+        # Get existing widgets
+        _, status_label, delete_btn, _, _, _ = self.entry_rows[idx]
+        
+        # Create refresh button and add it to action frame
+        action_frame = delete_btn.master  # Get the parent frame
+        refresh_btn = ttk.Button(action_frame, text="🔄", width=3, command=lambda: self._refresh_symbol_conid(symbol, row_frame))
+        refresh_btn.pack(side="left", padx=2, before=delete_btn)
+        
+        # Update entry_rows list
+        self.entry_rows[idx] = (entry, status_label, delete_btn, refresh_btn, symbol, row_frame)
+        
+        # Set initial status to fetching
+        status_label.config(text="⏳")
+        
+        # Auto-fetch conID in background
+        def fetch_conid():
+            if not general_app.is_connected:
+                self.after(0, lambda: status_label.config(text="❌"))
+                return
+            
+            success = self.work_symbols.refresh_symbol_conid(symbol)
+            self.after(0, lambda: status_label.config(text="✅" if success else "❌"))
+        
+        threading.Thread(target=fetch_conid, daemon=True).start()
         
         # Create new empty row below and focus it
         new_row = self._create_entry_row(is_new_row=True)
         # Focus the new entry after a short delay to ensure it's created
         def focus_new_entry():
-            for entry_widget, _, _, symbol, _ in self.entry_rows:
-                if symbol is None:  # Empty row
+            for entry_widget, _, _, _, s, _ in self.entry_rows:
+                if s is None:  # Empty row
                     entry_widget.focus()
                     break
         self.after(10, focus_new_entry)
@@ -143,12 +184,36 @@ class WorkSymbolsView(tk.Toplevel):
     def _remove_row(self, row_frame):
         """Remove a row and the symbol from work_symbols"""
         # Find the row in entry_rows
-        for i, (entry, status_label, delete_btn, symbol, rf) in enumerate(self.entry_rows):
+        for i, (entry, status_label, delete_btn, refresh_btn, symbol, rf) in enumerate(self.entry_rows):
             if rf == row_frame:
                 if symbol:
                     self.work_symbols.remove_symbol(symbol)
                 row_frame.destroy()
                 self.entry_rows.pop(i)
+                break
+    
+    def _refresh_symbol_conid(self, symbol: str, row_frame):
+        """Refresh conID for a single symbol"""
+        if not general_app.is_connected:
+            messagebox.showerror("Error", "TWS not connected")
+            return
+        
+        # Update status to show fetching
+        self._update_status_for_symbol(symbol, "⏳")
+        
+        def worker():
+            success = self.work_symbols.refresh_symbol_conid(symbol)
+            self.after(0, lambda: self._update_status_for_symbol(symbol, "✅" if success else "❌"))
+            if not success:
+                self.after(0, lambda: messagebox.showerror("Error", f"Failed to resolve conID for {symbol}"))
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    def _update_status_for_symbol(self, symbol: str, status: str):
+        """Update status label for a specific symbol"""
+        for entry, status_label, delete_btn, refresh_btn, s, row_frame in self.entry_rows:
+            if s == symbol:
+                status_label.config(text=status)
                 break
     
     def _load_existing_symbols(self):
@@ -243,7 +308,7 @@ class WorkSymbolsView(tk.Toplevel):
     def _update_status_labels(self):
         """Update status labels for all rows based on current work_symbols state"""
         ready_symbols = self.work_symbols.get_ready_symbols()
-        for entry, status_label, delete_btn, symbol, row_frame in self.entry_rows:
+        for entry, status_label, delete_btn, refresh_btn, symbol, row_frame in self.entry_rows:
             if symbol:
                 status = "✅" if ready_symbols.get(symbol, False) else "❌"
                 status_label.config(text=status)

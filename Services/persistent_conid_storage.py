@@ -49,6 +49,15 @@ class PersistentConidStorage:
                 )
                 """
             )
+            # Work symbols list table (persistence)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS work_symbols_list (
+                    symbol TEXT PRIMARY KEY,
+                    added_at TEXT NOT NULL
+                )
+                """
+            )
             conn.commit()
 
     def store_conid(self, symbol: str, conid: str) -> None:
@@ -222,6 +231,45 @@ class PersistentConidStorage:
             if row:
                 return json.loads(row[0])
         return None
+
+    # ========== Work Symbols List Methods ==========
+    
+    def save_work_symbol(self, symbol: str) -> None:
+        """
+        Save a symbol to the work symbols list.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO work_symbols_list (symbol, added_at)
+                VALUES (?, ?)
+                """,
+                (symbol.upper(), now)
+            )
+            conn.commit()
+    
+    def remove_work_symbol(self, symbol: str) -> None:
+        """
+        Remove a symbol from the work symbols list.
+        """
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM work_symbols_list WHERE symbol = ?",
+                (symbol.upper(),)
+            )
+            conn.commit()
+    
+    def load_work_symbols(self) -> list:
+        """
+        Load all symbols from the work symbols list.
+        Returns list of symbol strings.
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT symbol FROM work_symbols_list ORDER BY added_at"
+            )
+            return [row[0] for row in cur.fetchall()]
 
 
 # Example usage:
