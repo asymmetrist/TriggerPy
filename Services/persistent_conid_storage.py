@@ -15,12 +15,27 @@ class PersistentConidStorage:
 
     def _init_db(self):
         with self._get_conn() as conn:
+            # Stock conIDs table
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conids (
                     symbol TEXT PRIMARY KEY,
                     conid TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            # Option conIDs table
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS option_conids (
+                    symbol TEXT NOT NULL,
+                    expiry TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    right TEXT NOT NULL,
+                    conid TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, expiry, strike, right)
                 )
                 """
             )
@@ -79,6 +94,84 @@ class PersistentConidStorage:
         if not last_update:
             return False
         return datetime.utcnow() - last_update <= timedelta(days=days)
+
+    # ========== Option ConID Methods ==========
+    
+    def store_option_conid(self, symbol: str, expiry: str, strike: float, right: str, conid: str) -> None:
+        """
+        Insert or update an option conID for a given symbol/expiry/strike/right combination.
+        """
+        now = datetime.utcnow().isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO option_conids (symbol, expiry, strike, right, conid, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, expiry, strike, right)
+                DO UPDATE SET
+                    conid = excluded.conid,
+                    updated_at = excluded.updated_at
+                """,
+                (symbol.upper(), expiry, float(strike), right.upper(), conid, now),
+            )
+            conn.commit()
+
+    def get_option_conid(self, symbol: str, expiry: str, strike: float, right: str) -> Optional[str]:
+        """
+        Retrieve the option conID for a given symbol/expiry/strike/right combination.
+        """
+        with self._get_conn() as conn:
+            cur = conn.execute(
+                "SELECT conid FROM option_conids WHERE symbol = ? AND expiry = ? AND strike = ? AND right = ?",
+                (symbol.upper(), expiry, float(strike), right.upper()),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def get_cached_option_conids(self, symbol: str, expiry: str = None) -> list:
+        """
+        Get all cached option conIDs for a symbol (optionally filtered by expiry).
+        Returns list of dicts with keys: expiry, strike, right, conid, updated_at
+        """
+        with self._get_conn() as conn:
+            if expiry:
+                cur = conn.execute(
+                    "SELECT expiry, strike, right, conid, updated_at FROM option_conids WHERE symbol = ? AND expiry = ?",
+                    (symbol.upper(), expiry),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT expiry, strike, right, conid, updated_at FROM option_conids WHERE symbol = ?",
+                    (symbol.upper(),),
+                )
+            rows = cur.fetchall()
+            return [
+                {
+                    "expiry": row[0],
+                    "strike": row[1],
+                    "right": row[2],
+                    "conid": row[3],
+                    "updated_at": row[4],
+                }
+                for row in rows
+            ]
+
+    def clear_option_conids(self, symbol: str, expiry: str = None) -> None:
+        """
+        Clear cached option conIDs for a symbol (optionally filtered by expiry).
+        """
+        with self._get_conn() as conn:
+            if expiry:
+                conn.execute(
+                    "DELETE FROM option_conids WHERE symbol = ? AND expiry = ?",
+                    (symbol.upper(), expiry),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM option_conids WHERE symbol = ?",
+                    (symbol.upper(),),
+                )
+            conn.commit()
 
 
 # Example usage:
