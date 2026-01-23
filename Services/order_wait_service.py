@@ -13,6 +13,7 @@ from Services.tws_service import create_tws_service, TWSService
 from Services.polygon_service import polygon_service, PolygonService
 from Services.amo_service import amo, LOSS
 from Services.nasdaq_info import is_market_closed_or_pre_market
+from Services.order_pipeline_states import OrderPipeline
 
 class OrderWaitService:
     def __init__(self, polygon_service: PolygonService, tws_service: TWSService, poll_interval=0.1):
@@ -1140,190 +1141,35 @@ class OrderWaitService:
                 tinfo.update_status(STATUS_CANCELLED, last_price=last_price)
 
     def _finalize_order(self, order_id: str, order: Order, tinfo: ThreadInfo, last_price):
-        """Sends the entry order to TWS and handles cleanup and status updates."""
+        """
+        Finalizes an order using the State Pattern pipeline.
         
-        logging.info(f"[WaitService] _finalize_order called | order_id={order_id} | entry_price={getattr(order, 'entry_price', None)} | _order_ready={getattr(order, '_order_ready', None)}")
+        Delegates to OrderPipeline which handles:
+        - Premium fetching
+        - Entry price calculation
+        - Order placement
+        - Fill waiting
+        - Stop-loss watcher setup
+        """
+        logging.info(
+            f"[WaitService] _finalize_order called | order_id={order_id} | "
+            f"entry_price={getattr(order, 'entry_price', None)} | "
+            f"_order_ready={getattr(order, '_order_ready', None)}"
+        )
         
-        # Ensure we're in RTH (shouldn't be called in premarket, but double-check)
-        if is_market_closed_or_pre_market():
-            logging.error(
-                f"[WaitService] _finalize_order called in premarket - this should not happen! | order_id={order_id}"
-            )
-            return
+        # ✅ Use State Pattern pipeline
+        pipeline = OrderPipeline(order, self, self.tws, tinfo)
+        success = pipeline.execute()
         
-        # ✅ FIX: Check if entry_price needs to be calculated (even if _order_ready=True)
-        # OrderFixerService may have set _order_ready=True but didn't set entry_price
-        if not order.entry_price or order.entry_price <= 0:
-            logging.info(f"[WaitService] entry_price not set - calculating from premium | order_id={order_id}")
-            
-            # Get model and args
-            model = getattr(order, "_model", None)
-            _args = getattr(order, "_args", {})
-            arcTick = _args.get("arcTick", 0.01)
-            position_size = getattr(order, "_position_size", _args.get("position", 2000))
-            
-            # Try to get premium from order.premium (set by OrderFixerService)
-            premium = getattr(order, "premium", None)
-            
-            # If no premium, try stream first
-            if not premium or premium <= 0:
-                premium = self.get_streamed_premium(order)
-            
-            # If still no premium, wait for stream (no snapshot fallback)
-            if not premium or premium <= 0:
-                logging.info(f"[WaitService] Premium not available from stream, waiting... | order_id={order_id}")
-                max_wait = 1.0  # Wait up to 1 second for stream
-                wait_interval = 0.05
-                waited = 0
-                
-                while waited < max_wait:
-                    premium = self.get_streamed_premium(order)
-                    if premium and premium > 0:
-                        logging.info(
-                            f"[WaitService] ✅ Premium received from stream after {waited:.2f}s | "
-                            f"order_id={order_id} | premium={premium}"
-                        )
-                        break
-                    time.sleep(wait_interval)
-                    waited += wait_interval
-                
-                if not premium or premium <= 0:
-                    error_msg = f"Streamed premium not available after {max_wait}s wait"
-                    logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
-                    order.mark_failed(error_msg)
-                    return
-            
-            # ✅ Recalculate SL/TP based on actual premium (if they were placeholders)
-            if order.sl_price == 0.5 or order.tp_price == 1.2:  # Placeholder values
-                order.sl_price = round(premium * 0.8, 2)
-                order.tp_price = round(premium * 1.2, 2)
-                logging.debug(f"[WaitService] Recalculated SL/TP: SL={order.sl_price} TP={order.tp_price} from premium={premium}")
-            
-            # Calculate entry_price from premium + arcTick
-            mid = premium + arcTick
-            if mid < 3:
-                tick = 0.01
-            elif mid >= 5:
-                tick = 0.15
-            else:
-                tick = 0.05
-            
-            entry_price = round(int(mid / tick) * tick, 2)
-            
-            # Update order with calculated values
-            order.entry_price = entry_price
-            
-            # Update qty if not set (should be set by OrderFixerService, but just in case)
-            if not order.qty or order.qty <= 0:
-                qty = int(position_size // premium) if premium > 0 else 1
-                if qty <= 0:
-                    qty = 1
-                order.qty = qty
-                logging.info(f"[WaitService] Calculated qty={qty} from premium={premium} | order_id={order_id}")
-            
-            # Set SL/TP if not already set (fallback to model defaults)
-            if not order.sl_price:
-                if model and hasattr(model, "_stop_loss") and model._stop_loss:
-                    order.sl_price = model._stop_loss
-                else:
-                    order.sl_price = round(entry_price * 0.8, 2)
-            
-            if not order.tp_price:
-                if model and hasattr(model, "_take_profit") and model._take_profit:
-                    order.tp_price = model._take_profit
-                else:
-                    order.tp_price = round(entry_price * 1.2, 2)
-            
-            logging.info(
-                f"[WaitService] Order prepared with premium pipeline | order_id={order_id} | "
-                f"premium={premium} | entry_price={entry_price} | qty={order.qty}"
-            )
+        if not success:
+            # Pipeline failed - update watcher info
+            watcher_info.update_watcher(order_id, STATUS_FAILED)
+            if tinfo:
+                tinfo.update_status(STATUS_FAILED, last_price=last_price)
         
-        # Helper to update tinfo if it exists (for poll mode)
-        def _update_tinfo_status(status, **kwargs):
-            # 💡 MODIFIED: Find the watcher info, whether from poll thread (tinfo) or WS (lookup)
-            active_tinfo = tinfo or watcher_info.get_watcher(order_id)
-            if active_tinfo:
-                active_tinfo.update_status(status, last_price=last_price, **kwargs)
-
-
-        # ✅ FINAL SAFETY CHECK: Ensure entry_price is set before placing order
-        if not order.entry_price or order.entry_price <= 0:
-            error_msg = f"Order {order_id} entry_price is not set ({order.entry_price}). Cannot place order."
-            logging.error(f"[WaitService] {error_msg}")
-            order.mark_failed(error_msg)
-            _update_tinfo_status(STATUS_FAILED, info={"error": error_msg})
-            return
-        
-        try:
-            start_ts = time.time() * 1000
-            logging.info(f"[TWS-LATENCY] {order.symbol} Trigger hit → sending ENTRY order "
-                        f"({order.right}{order.strike}) at {start_ts:.0f} ms | entry_price={order.entry_price} | qty={order.qty}")
-            success = self.tws.place_custom_order(order)
-            if success:
-                end_ts = time.time() * 1000
-                latency = end_ts - start_ts
-                logging.info(f"[TWS-LATENCY] {order.symbol} Order sent in {latency:.1f} ms "
-                            f"(start {start_ts:.0f} → end {end_ts:.0f})")
-
-                order.mark_active(result=f"IB Order ID: {order._ib_order_id}")
-                if getattr(order, "_status_callback", None):
-                    try:
-                        order._status_callback(f"Finalized: {order.symbol} {order.order_id}", "green")
-                    except Exception as e:
-                        logging.error(f"[WaitService] UI callback failed for finalized order {order.order_id}: {e}")
-                
-                if getattr(order, "_fill_event", None):
-                    filled = order._fill_event.wait(timeout=60)
-                    if filled and order.state == OrderState.FINALIZED:
-                        order_manager.add_finalized_order(order_id, order)
-                        msg = f"[WaitService] Order finalized {order_id} → IB ID: {order._ib_order_id}"
-                        logging.info(msg)
-                        watcher_info.update_watcher(order_id, STATUS_FINALIZED)
-                        _update_tinfo_status(STATUS_FINALIZED)
-                    else:
-                        logging.warning(f"[WaitService] Order {order_id} not filled within timeout window.")
-                        # Even if not filled, we mark the *watcher* as finalized if the order was sent
-                        _update_tinfo_status(STATUS_FAILED, info={"error": "Fill event timed out"}) 
-
-                # ✅ if stop-loss configured, launch stop-loss watcher
-                    if order.trigger or (order.sl_price and order.state == OrderState.FINALIZED):
-                        stop_loss_level = order.trigger - order.sl_price if order.right == 'C' or order.right == "CALL" else order.trigger + order.sl_price
-                        exit_order = Order(
-                            symbol=order.symbol,
-                            expiry=order.expiry,
-                            strike=order.strike,
-                            right=order.right,
-                            qty=order.qty,
-                            entry_price=order.entry_price,   # keeps breakeven reference
-                            tp_price=None,
-                            sl_price=order.sl_price,
-                            action="SELL",
-                            type="MKT", # Use MKT for guaranteed stop-loss exit
-                            trigger=None
-                        )
-                        ex_order = exit_order.set_position_size(order._position_size) 
-                        ex_order.previous_id = order.order_id
-                        ex_order.mark_active()
-                        logging.info(f"[WAITSERVICE] Spawned EXIT watcher {ex_order.order_id} "
-                                f"stop={stop_loss_level} ({order.right})")
-                        
-                 
-                        self.start_stop_loss_watcher(ex_order, stop_loss_level, mode="poll")
-
-
-            else:
-                order.mark_failed("Failed to place order with TWS")
-                msg = f"[WaitService] Order placement failed {order_id}"
-                logging.error(msg)
-                watcher_info.update_watcher(order_id, STATUS_FAILED)
-                _update_tinfo_status(STATUS_FAILED, info={"error": "TWS place_custom_order failed"})
-
-        except Exception as e:
-            order.mark_failed(str(e))
-            msg = f"[WaitService] Finalize failed {order_id}: {e}"
-            logging.exception(msg) # 💡 Use exception logging
-            _update_tinfo_status(STATUS_FAILED, info={"error": str(e)})
+        logging.info(
+            f"[WaitService] _finalize_order completed | order_id={order_id} | success={success}"
+        )
 
     def get_order_status(self, order_id: str):
         return self.tws.get_order_status(order_id)
