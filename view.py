@@ -613,7 +613,25 @@ class OrderFrame(tk.Frame):
     def on_maturity_selected(self, event=None):
         maturity = self.combo_maturity.get()
         if maturity and self.model:
-            self.load_strikes_async(maturity)
+            # ✅ Trigger strike population when maturity is selected
+            def worker():
+                try:
+                    # Get current trigger price or underlying price
+                    trigger_str = self.entry_trigger.get()
+                    if trigger_str:
+                        centre = float(trigger_str)
+                    else:
+                        # Fallback to underlying price
+                        price = self.model.refresh_market_price()
+                        if price:
+                            centre = price
+                        else:
+                            return
+                    self._populate_strike_combo(centre)
+                except Exception as e:
+                    logging.error(f"Maturity selection strike load error: {e}")
+            
+            threading.Thread(target=worker, daemon=True).start()
 
     # ---------- async loaders ----------
     def load_maturities_async(self, token: int):
@@ -640,8 +658,23 @@ class OrderFrame(tk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def load_strikes_async(self, maturity: str):
-        # placeholder if needed later
-        pass
+        # ✅ Trigger strike population (called from on_maturity_selected)
+        def worker():
+            try:
+                trigger_str = self.entry_trigger.get()
+                if trigger_str:
+                    centre = float(trigger_str)
+                else:
+                    price = self.model.refresh_market_price()
+                    if price:
+                        centre = price
+                    else:
+                        return
+                self._populate_strike_combo(centre)
+            except Exception as e:
+                logging.error(f"Load strikes async error: {e}")
+        
+        threading.Thread(target=worker, daemon=True).start()
 
     # ---------- actions ----------
     def _on_pm_high_rebase(self):
