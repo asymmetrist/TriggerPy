@@ -576,9 +576,10 @@ class ArcTriggerApp(tk.Tk):
             speed = result["speed"]
             
             # Initialize replay service
-            from Replay.replay_service import ReplayService
+            from Replay.replay_service import ReplayService, set_replay_service
             
             self.replay_service = ReplayService()
+            set_replay_service(self.replay_service)  # Register globally for price lookups
             self.replay_mode = True
             
             # Start replay in background thread
@@ -612,12 +613,17 @@ class ArcTriggerApp(tk.Tk):
     
     def _stop_replay_mode(self):
         """Stop replay mode."""
+        from Replay.replay_service import set_replay_service
+        
         if self.replay_service:
             try:
                 self.replay_service.stop_replay()
             except Exception as e:
                 logging.error(f"[UI] Error stopping replay: {e}")
             self.replay_service = None
+        
+        # Unregister replay service
+        set_replay_service(None)
         
         self.replay_mode = False
         self.replay_status_label.config(text="", foreground="gray")

@@ -370,6 +370,11 @@ class AppModel:
         return self._order
 
     def refresh_market_price(self) -> Optional[float]:
+        """
+        Refresh market price. During replay mode, uses replayed price.
+        """
+        # Check if replay is active (get_replay_price already handles this)
+        # get_last_trade will check replay mode internally
         try:
             self._underlying_price = general_app.polygon.get_last_trade(self._symbol)
             logging.info(f"AppModel[{self._symbol}]: Market price {self._underlying_price}")

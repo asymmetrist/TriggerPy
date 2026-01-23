@@ -217,6 +217,20 @@ class PolygonService:
 
 
     def get_last_trade(self, symbol: str):
+        """
+        Get last trade price. During replay mode, returns replayed price.
+        """
+        # Check if replay is active and get replayed price
+        try:
+            from Replay.replay_service import get_replay_price
+            replay_price = get_replay_price(symbol)
+            if replay_price is not None:
+                logging.debug(f"[Polygon] Using replayed price for {symbol}: {replay_price}")
+                return replay_price
+        except Exception as e:
+            logging.debug(f"[Polygon] Replay check failed (normal if not replaying): {e}")
+        
+        # Normal real-time fetch
         url = f"{self.base_url}/v2/last/trade/{symbol.upper()}"
         params = {"apiKey": self.api_key}
         try:
@@ -233,7 +247,28 @@ class PolygonService:
     def get_snapshot(self, symbol: str):
         """
         Real-time L1 snapshot for a single stock – Polygon v2 Pro endpoint.
+        During replay mode, returns simulated snapshot from replayed prices.
         """
+        # Check if replay is active and get replayed price
+        try:
+            from Replay.replay_service import get_replay_price
+            replay_price = get_replay_price(symbol)
+            if replay_price is not None:
+                # Return simulated snapshot from replayed price
+                logging.debug(f"[Polygon] Using replayed price for {symbol}: {replay_price}")
+                return {
+                    "last": replay_price,
+                    "bid": replay_price * 0.9999,  # Approximate bid (0.01% below)
+                    "ask": replay_price * 1.0001,  # Approximate ask (0.01% above)
+                    "today_high": replay_price,
+                    "today_low": replay_price,
+                    "prev_high": None,
+                    "prev_low": None,
+                }
+        except Exception as e:
+            logging.debug(f"[Polygon] Replay check failed (normal if not replaying): {e}")
+        
+        # Normal real-time fetch
         url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol.upper()}"
         params = {"apiKey": self.api_key}
 

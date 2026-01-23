@@ -28,6 +28,8 @@ class ReplayService:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # Start unpaused
+        self._last_replayed_prices = {}  # symbol -> last price
+        self._price_lock = threading.Lock()
         
     def start_replay(
         self,
@@ -187,6 +189,10 @@ class ReplayService:
                 # Inject tick via callback manager
                 symbol = tick["symbol"]
                 price = tick["price"]
+                
+                # Store last replayed price for this symbol
+                with self._price_lock:
+                    self._last_replayed_prices[symbol.upper()] = price
                 
                 # Batch triggers to reduce overhead - only trigger if price changed significantly
                 # or if it's been more than 100ms since last trigger
