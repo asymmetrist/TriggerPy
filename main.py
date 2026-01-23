@@ -414,74 +414,112 @@ class ArcTriggerApp(tk.Tk):
             self._stop_replay_mode()
     
     def _start_replay_mode(self):
-        """Start replay mode - show dialog to configure replay."""
-        from tkinter import simpledialog, messagebox
+        """Start replay mode - show single configuration dialog."""
+        from tkinter import Toplevel, ttk, messagebox
+        from datetime import datetime
         
-        try:
-            # Get date
-            date = simpledialog.askstring(
-                "Replay Mode",
-                "Enter date to replay (YYYY-MM-DD):\n\nExample: 2026-01-22",
-                initialvalue="2026-01-22"
-            )
-            if not date:
-                return
+        # Create single configuration window
+        config_win = Toplevel(self)
+        config_win.title("Replay Mode Configuration")
+        config_win.geometry("450x350")
+        config_win.configure(bg="#1a1a1a")
+        config_win.transient(self)
+        config_win.grab_set()
+        
+        # Center the window
+        config_win.update_idletasks()
+        x = (config_win.winfo_screenwidth() // 2) - (450 // 2)
+        y = (config_win.winfo_screenheight() // 2) - (350 // 2)
+        config_win.geometry(f"450x350+{x}+{y}")
+        
+        # Variables
+        date_var = tk.StringVar(value="2026-01-22")
+        symbol_var = tk.StringVar(value="TSLA")
+        start_time_var = tk.StringVar(value="04:00:00")
+        end_time_var = tk.StringVar(value="20:00:00")
+        speed_var = tk.StringVar(value="1.0")
+        result = {"confirmed": False}
+        
+        # Title
+        title_label = tk.Label(
+            config_win,
+            text="🎬 Replay Mode Configuration",
+            font=("Arial", 14, "bold"),
+            bg="#1a1a1a",
+            fg="white"
+        )
+        title_label.pack(pady=10)
+        
+        # Form frame
+        form_frame = ttk.Frame(config_win)
+        form_frame.pack(pady=10, padx=20, fill="x")
+        
+        # Date
+        ttk.Label(form_frame, text="Date (YYYY-MM-DD):").grid(row=0, column=0, sticky="w", pady=5)
+        date_entry = ttk.Entry(form_frame, textvariable=date_var, width=20)
+        date_entry.grid(row=0, column=1, sticky="ew", pady=5, padx=5)
+        
+        # Symbol
+        ttk.Label(form_frame, text="Symbol:").grid(row=1, column=0, sticky="w", pady=5)
+        symbol_entry = ttk.Entry(form_frame, textvariable=symbol_var, width=20)
+        symbol_entry.grid(row=1, column=1, sticky="ew", pady=5, padx=5)
+        
+        # Start time
+        ttk.Label(form_frame, text="Start Time (HH:MM:SS):").grid(row=2, column=0, sticky="w", pady=5)
+        start_time_entry = ttk.Entry(form_frame, textvariable=start_time_var, width=20)
+        start_time_entry.grid(row=2, column=1, sticky="ew", pady=5, padx=5)
+        
+        # End time
+        ttk.Label(form_frame, text="End Time (HH:MM:SS):").grid(row=3, column=0, sticky="w", pady=5)
+        end_time_entry = ttk.Entry(form_frame, textvariable=end_time_var, width=20)
+        end_time_entry.grid(row=3, column=1, sticky="ew", pady=5, padx=5)
+        
+        # Speed
+        ttk.Label(form_frame, text="Speed (1.0 = real-time):").grid(row=4, column=0, sticky="w", pady=5)
+        speed_entry = ttk.Entry(form_frame, textvariable=speed_var, width=20)
+        speed_entry.grid(row=4, column=1, sticky="ew", pady=5, padx=5)
+        
+        form_frame.columnconfigure(1, weight=1)
+        
+        # Info label
+        info_label = tk.Label(
+            config_win,
+            text="Examples:\n04:00:00 = Premarket | 09:30:00 = Market Open | 16:00:00 = Market Close",
+            font=("Arial", 8),
+            bg="#1a1a1a",
+            fg="gray",
+            justify="left"
+        )
+        info_label.pack(pady=5)
+        
+        # Buttons
+        button_frame = ttk.Frame(config_win)
+        button_frame.pack(pady=15)
+        
+        def on_start():
+            # Validate inputs
+            date = date_var.get().strip()
+            symbol = symbol_var.get().strip().upper()
+            start_time = start_time_var.get().strip()
+            end_time = end_time_var.get().strip()
+            speed_str = speed_var.get().strip()
             
-            # Validate date format
-            from datetime import datetime
+            # Validate date
             try:
                 datetime.strptime(date, "%Y-%m-%d")
             except ValueError:
-                messagebox.showerror("Invalid Date", "Date must be in YYYY-MM-DD format")
+                messagebox.showerror("Invalid Date", "Date must be in YYYY-MM-DD format", parent=config_win)
                 return
             
-            # Get symbol
-            symbol = simpledialog.askstring(
-                "Replay Mode",
-                "Enter symbol to replay:\n\nExample: TSLA",
-                initialvalue="TSLA"
-            )
-            if not symbol:
-                return
-            
-            # Get start time
-            start_time_str = simpledialog.askstring(
-                "Replay Mode",
-                "Start time (HH:MM:SS ET):\n\nExamples:\n04:00:00 = Premarket start\n09:30:00 = Market open\n14:00:00 = Afternoon",
-                initialvalue="04:00:00"
-            )
-            if not start_time_str:
-                return
-            
-            # Validate start time format
+            # Validate times
             try:
-                datetime.strptime(start_time_str, "%H:%M:%S")
+                datetime.strptime(start_time, "%H:%M:%S")
+                datetime.strptime(end_time, "%H:%M:%S")
             except ValueError:
-                messagebox.showerror("Invalid Time", "Start time must be in HH:MM:SS format")
+                messagebox.showerror("Invalid Time", "Times must be in HH:MM:SS format", parent=config_win)
                 return
             
-            # Get end time
-            end_time_str = simpledialog.askstring(
-                "Replay Mode",
-                "End time (HH:MM:SS ET):\n\nExamples:\n09:30:00 = Market open\n16:00:00 = Market close\n20:00:00 = After hours",
-                initialvalue="20:00:00"
-            )
-            if not end_time_str:
-                return
-            
-            # Validate end time format
-            try:
-                datetime.strptime(end_time_str, "%H:%M:%S")
-            except ValueError:
-                messagebox.showerror("Invalid Time", "End time must be in HH:MM:SS format")
-                return
-            
-            # Get speed
-            speed_str = simpledialog.askstring(
-                "Replay Mode",
-                "Replay speed:\n1.0 = real-time\n2.0 = 2x speed\n10.0 = 10x speed",
-                initialvalue="1.0"
-            )
+            # Validate speed
             try:
                 speed = float(speed_str) if speed_str else 1.0
                 if speed <= 0:
@@ -489,18 +527,53 @@ class ArcTriggerApp(tk.Tk):
             except:
                 speed = 1.0
             
+            if not symbol:
+                messagebox.showerror("Invalid Symbol", "Please enter a symbol", parent=config_win)
+                return
+            
             # Confirm
             confirm = messagebox.askyesno(
                 "Start Replay?",
                 f"Start replay mode?\n\n"
                 f"Date: {date}\n"
-                f"Symbol: {symbol.upper()}\n"
-                f"Time: {start_time_str} - {end_time_str} ET\n"
+                f"Symbol: {symbol}\n"
+                f"Time: {start_time} - {end_time} ET\n"
                 f"Speed: {speed}x\n\n"
-                f"⚠️ Orders will be placed to your paper account!"
+                f"⚠️ Orders will be placed to your paper account!",
+                parent=config_win
             )
-            if not confirm:
-                return
+            
+            if confirm:
+                result["confirmed"] = True
+                result["date"] = date
+                result["symbol"] = symbol
+                result["start_time"] = start_time
+                result["end_time"] = end_time
+                result["speed"] = speed
+                config_win.destroy()
+        
+        def on_cancel():
+            config_win.destroy()
+        
+        ttk.Button(button_frame, text="Start Replay", command=on_start).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side="left", padx=5)
+        
+        # Focus on first entry
+        date_entry.focus()
+        
+        # Wait for window to close
+        config_win.wait_window()
+        
+        if not result.get("confirmed"):
+            return
+        
+        try:
+            # Get values from result
+            date = result["date"]
+            symbol = result["symbol"]
+            start_time_str = result["start_time"]
+            end_time_str = result["end_time"]
+            speed = result["speed"]
             
             # Initialize replay service
             from Replay.replay_service import ReplayService
@@ -513,7 +586,7 @@ class ArcTriggerApp(tk.Tk):
                 try:
                     self.replay_service.start_replay(
                         date=date,
-                        symbols=[symbol.upper()],
+                        symbols=[symbol],
                         start_time=start_time_str,
                         end_time=end_time_str,
                         speed=speed,
@@ -528,10 +601,10 @@ class ArcTriggerApp(tk.Tk):
             
             # Update UI
             self.replay_status_label.config(
-                text=f"🎬 {symbol.upper()} {date} {start_time_str}-{end_time_str} ({speed}x)",
+                text=f"🎬 {symbol} {date} {start_time_str}-{end_time_str} ({speed}x)",
                 foreground="green"
             )
-            logging.info(f"[UI] Replay mode started: {symbol.upper()} on {date} from {start_time_str} to {end_time_str} at {speed}x speed")
+            logging.info(f"[UI] Replay mode started: {symbol} on {date} from {start_time_str} to {end_time_str} at {speed}x speed")
             
         except Exception as e:
             logging.error(f"[UI] Replay setup error: {e}", exc_info=True)

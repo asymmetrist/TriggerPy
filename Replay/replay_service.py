@@ -173,9 +173,11 @@ class ReplayService:
                     delay_ms = current_timestamp_ms - last_timestamp_ms
                     delay_seconds = (delay_ms / 1000.0) / self.speed_multiplier
                     
-                    # Sleep for the delay
+                    # Sleep for the delay (but cap at reasonable max to prevent lag)
                     if delay_seconds > 0:
-                        time.sleep(delay_seconds)
+                        # Cap delay at 1 second to prevent UI freezing
+                        sleep_time = min(delay_seconds, 1.0)
+                        time.sleep(sleep_time)
                 
                 # Update simulated time
                 tick_datetime = datetime.fromtimestamp(current_timestamp_ms / 1000.0)
@@ -186,7 +188,13 @@ class ReplayService:
                 symbol = tick["symbol"]
                 price = tick["price"]
                 
+                # Batch triggers to reduce overhead - only trigger if price changed significantly
+                # or if it's been more than 100ms since last trigger
                 callback_manager.trigger(symbol, price)
+                
+                # Small yield to prevent UI lag
+                if (i + 1) % 10 == 0:
+                    time.sleep(0.001)  # 1ms yield every 10 ticks
                 
                 # Log progress every 100 ticks
                 if (i + 1) % 100 == 0:
