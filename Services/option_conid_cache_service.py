@@ -1,12 +1,16 @@
 # option_conid_cache_service.py
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from Services.persistent_conid_storage import PersistentConidStorage
 from Services.tws_service import TWSService
 from Services.polygon_service import PolygonService
 from Services.work_symbols import work_symbols
+
+# Rate limiting: Max 3 concurrent conID resolutions to avoid overwhelming TWS
+_conid_semaphore = threading.Semaphore(3)
 
 
 def get_this_week_friday_expiry(symbol: str, tws_service: TWSService) -> Optional[str]:
@@ -143,24 +147,26 @@ def cache_option_conids_for_symbol(
     
     logging.info(f"[OptionConIDCache] Caching {len(strikes_to_cache)} strikes for {symbol} {expiry}")
     
-    # 5. Cache conIDs for each strike (CALL and PUT)
+    # 5. Cache conIDs for each strike (CALL and PUT) with rate limiting
     cached_count = 0
     total_attempted = 0
     
     for strike in strikes_to_cache:
         for right in ["C", "P"]:  # CALL and PUT
             total_attempted += 1
-            try:
-                contract = tws_service.create_option_contract(symbol, expiry, strike, right)
-                conid = tws_service.resolve_conid(contract, timeout=15)
-                if conid:
-                    storage.store_option_conid(symbol, expiry, strike, right, str(conid))
-                    cached_count += 1
-                    logging.info(f"[OptionConIDCache] ✅ Cached {symbol} {expiry} {strike}{right} → {conid}")
-                else:
-                    logging.warning(f"[OptionConIDCache] ❌ Failed to resolve conID for {symbol} {expiry} {strike}{right}")
-            except Exception as e:
-                logging.error(f"[OptionConIDCache] Error caching {symbol} {expiry} {strike}{right}: {e}")
+            # Use semaphore to limit concurrent conID resolutions (max 3 at a time)
+            with _conid_semaphore:
+                try:
+                    contract = tws_service.create_option_contract(symbol, expiry, strike, right)
+                    conid = tws_service.resolve_conid(contract, timeout=15)
+                    if conid:
+                        storage.store_option_conid(symbol, expiry, strike, right, str(conid))
+                        cached_count += 1
+                        logging.info(f"[OptionConIDCache] ✅ Cached {symbol} {expiry} {strike}{right} → {conid}")
+                    else:
+                        logging.warning(f"[OptionConIDCache] ❌ Failed to resolve conID for {symbol} {expiry} {strike}{right}")
+                except Exception as e:
+                    logging.error(f"[OptionConIDCache] Error caching {symbol} {expiry} {strike}{right}: {e}")
     
     logging.info(f"[OptionConIDCache] Completed: Cached {cached_count}/{total_attempted} option conIDs for {symbol} (expiry={expiry})")
     return (cached_count, total_attempted)

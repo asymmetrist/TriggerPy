@@ -6,7 +6,7 @@ import threading
 import logging
 
 from model import general_app
-from Services.work_symbols import WorkSymbols
+from Services.work_symbols import WorkSymbols, work_symbols
 from Services.persistent_conid_storage import storage, PersistentConidStorage
 
 
@@ -14,92 +14,157 @@ class WorkSymbolsView(tk.Toplevel):
     def __init__(self, parent, storage: PersistentConidStorage = storage):
         super().__init__(parent)
         self.title("Work Symbols (Daily)")
-        self.geometry("700x500")
+        self.geometry("600x500")
 
         self.storage = storage
-        self.work_symbols = WorkSymbols(self.storage)
+        self.work_symbols = work_symbols  # Use the global singleton instead of creating new instance
+        self.entry_rows = []  # List of (entry_widget, status_label, delete_btn, symbol) tuples
+        self._refresh_in_progress = False  # Guard to prevent multiple simultaneous refresh operations
 
         self._build_ui()
-        self._refresh_list()
+        self._load_existing_symbols()
 
     # -------------------------------------------------
     # UI
     # -------------------------------------------------
     def _build_ui(self):
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=10, pady=10)
+        # Header
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=10, pady=5)
+        ttk.Label(header, text="Work Symbols", font=("Arial", 12, "bold")).pack(side="left")
+        
+        # Scrollable frame for entry rows
+        canvas_frame = ttk.Frame(self)
+        canvas_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bind mousewheel to canvas
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Column headers
+        header_row = ttk.Frame(self.scrollable_frame)
+        header_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(header_row, text="Symbol", font=("Arial", 9, "bold"), width=15).pack(side="left", padx=5)
+        ttk.Label(header_row, text="Status", font=("Arial", 9, "bold"), width=10).pack(side="left", padx=5)
+        ttk.Label(header_row, text="Action", font=("Arial", 9, "bold"), width=10).pack(side="left", padx=5)
 
-        ttk.Label(top, text="Search Symbol").pack(side="left")
-        self.entry_search = ttk.Entry(top, width=20)
-        self.entry_search.pack(side="left", padx=5)
-        self.entry_search.bind("<KeyRelease>", self._on_search)
-
-        self.combo_results = ttk.Combobox(top, width=25)
-        self.combo_results.pack(side="left", padx=5)
-
-        ttk.Button(top, text="Add", command=self._add_symbol).pack(side="left", padx=5)
-
-        # -------------------------------------------------
-        mid = ttk.Frame(self)
-        mid.pack(fill="both", expand=True, padx=10, pady=10)
-
-        cols = ("Symbol", "ConID Ready")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings")
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, anchor="center")
-
-        self.tree.pack(fill="both", expand=True)
-
-        # -------------------------------------------------
+        # Bottom buttons
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=10, pady=10)
-
-        ttk.Button(bottom, text="Remove Selected", command=self._remove_selected).pack(side="left")
-        ttk.Button(bottom, text="Refresh All ConIDs", command=self._refresh_conids).pack(side="left", padx=10)
-        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
+        self.refresh_btn = ttk.Button(bottom, text="Refresh All ConIDs", command=self._refresh_conids)
+        self.refresh_btn.pack(side="left", padx=5)
+        ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right", padx=5)
 
     # -------------------------------------------------
     # Logic
     # -------------------------------------------------
-    def _on_search(self, event=None):
-        query = self.entry_search.get().upper()
-        if len(query) < 2:
-            self.combo_results["values"] = ()
-            return
-
-        def worker():
-            try:
-                results = general_app.search_symbol(query) or []
-                values = [
-                    r["symbol"]
-                    for r in results
-                    if (r.get("primaryExchange") or "").upper() in {"NASDAQ", "NYSE"}
-                ]
-            except Exception as e:
-                logging.error(f"Search error: {e}")
-                values = []
-
-            self.after(0, lambda: self.combo_results.configure(values=values))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _add_symbol(self):
-        symbol = self.combo_results.get().strip().upper()
+    def _create_entry_row(self, symbol="", is_new_row=False):
+        """Create a new entry row. If is_new_row=True, it's an empty row for adding new symbols."""
+        row_frame = ttk.Frame(self.scrollable_frame)
+        row_frame.pack(fill="x", pady=2)
+        
+        entry = ttk.Entry(row_frame, width=15, font=("Arial", 10))
+        entry.pack(side="left", padx=5)
+        
+        status_label = ttk.Label(row_frame, text="", width=10)
+        status_label.pack(side="left", padx=5)
+        
+        delete_btn = ttk.Button(row_frame, text="✕", width=3, command=lambda: self._remove_row(row_frame))
+        delete_btn.pack(side="left", padx=5)
+        
+        if symbol:
+            entry.insert(0, symbol)
+            entry.config(state="readonly")  # Make existing symbols read-only
+            status = "✅" if self.work_symbols.get_ready_symbols().get(symbol, False) else "❌"
+            status_label.config(text=status)
+        
+        if is_new_row:
+            entry.focus()
+            entry.bind("<Return>", lambda e: self._on_entry_enter(entry, row_frame))
+            entry.bind("<FocusOut>", lambda e: self._on_entry_focus_out(e, entry, row_frame))
+        
+        self.entry_rows.append((entry, status_label, delete_btn, symbol if symbol else None, row_frame))
+        return row_frame
+    
+    def _on_entry_enter(self, entry, row_frame):
+        """Handle Enter key press in entry field"""
+        symbol = entry.get().strip().upper()
         if not symbol:
             return
+        
+        # Add symbol to work_symbols
         self.work_symbols.add_symbol(symbol)
-        self._refresh_list()
-
-    def _remove_selected(self):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        symbol = self.tree.item(sel[0])["values"][0]
-        self.work_symbols.remove_symbol(symbol)
-        self._refresh_list()
-
+        
+        # Update this row to show the symbol (make it read-only)
+        entry.config(state="readonly")
+        entry.unbind("<Return>")
+        entry.unbind("<FocusOut>")
+        status = "❌"  # New symbol, conID not ready yet
+        idx = next(i for i, (e, _, _, _, _) in enumerate(self.entry_rows) if e == entry)
+        self.entry_rows[idx] = (entry, self.entry_rows[idx][1], self.entry_rows[idx][2], symbol, row_frame)
+        self.entry_rows[idx][1].config(text=status)
+        
+        # Create new empty row below and focus it
+        new_row = self._create_entry_row(is_new_row=True)
+        # Focus the new entry after a short delay to ensure it's created
+        def focus_new_entry():
+            for entry_widget, _, _, symbol, _ in self.entry_rows:
+                if symbol is None:  # Empty row
+                    entry_widget.focus()
+                    break
+        self.after(10, focus_new_entry)
+    
+    def _on_entry_focus_out(self, event, entry, row_frame):
+        """Handle focus out - if empty and not the last empty row, remove it"""
+        symbol = entry.get().strip().upper()
+        if not symbol:
+            # Count how many empty rows exist
+            empty_count = sum(1 for _, _, _, s, _ in self.entry_rows if s is None)
+            # Only remove if there's more than one empty row
+            if empty_count > 1:
+                self._remove_row(row_frame)
+    
+    def _remove_row(self, row_frame):
+        """Remove a row and the symbol from work_symbols"""
+        # Find the row in entry_rows
+        for i, (entry, status_label, delete_btn, symbol, rf) in enumerate(self.entry_rows):
+            if rf == row_frame:
+                if symbol:
+                    self.work_symbols.remove_symbol(symbol)
+                row_frame.destroy()
+                self.entry_rows.pop(i)
+                break
+    
+    def _load_existing_symbols(self):
+        """Load existing symbols from work_symbols and create rows"""
+        symbols = list(self.work_symbols.get_ready_symbols().keys())
+        for symbol in symbols:
+            self._create_entry_row(symbol=symbol, is_new_row=False)
+        # Add one empty row at the end for new entries
+        self._create_entry_row(is_new_row=True)
+    
     def _refresh_conids(self):
+        # Guard: Prevent multiple simultaneous refresh operations
+        if self._refresh_in_progress:
+            messagebox.showwarning("Warning", "Refresh already in progress. Please wait for it to complete.")
+            return
+        
         if not general_app.is_connected:
             messagebox.showerror("Error", "TWS not connected")
             return
@@ -122,6 +187,10 @@ class WorkSymbolsView(tk.Toplevel):
 
         if not response:
             return
+
+        # Disable button and set flag
+        self._refresh_in_progress = True
+        self.refresh_btn.config(state="disabled", text="Refreshing...")
 
         def worker():
             try:
@@ -147,7 +216,9 @@ class WorkSymbolsView(tk.Toplevel):
                 
                 # Update UI and show results
                 def update_ui():
-                    self._refresh_list()
+                    self._update_status_labels()
+                    self._refresh_in_progress = False
+                    self.refresh_btn.config(state="normal", text="Refresh All ConIDs")
                     messagebox.showinfo(
                         "Refresh Complete",
                         f"✅ Stock conIDs refreshed\n"
@@ -161,13 +232,18 @@ class WorkSymbolsView(tk.Toplevel):
             except Exception as e:
                 logging.error(f"[WorkSymbolsView] Error refreshing conIDs: {e}")
                 def show_error():
+                    self._update_status_labels()
+                    self._refresh_in_progress = False
+                    self.refresh_btn.config(state="normal", text="Refresh All ConIDs")
                     messagebox.showerror("Error", f"Failed to refresh conIDs:\n{str(e)}")
-                    self._refresh_list()  # Still refresh the list even if there was an error
                 self.after(0, show_error)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def _refresh_list(self):
-        self.tree.delete(*self.tree.get_children())
-        for symbol, ready in self.work_symbols.get_ready_symbols().items():
-            self.tree.insert("", "end", values=(symbol, "✅" if ready else "❌"))
+    
+    def _update_status_labels(self):
+        """Update status labels for all rows based on current work_symbols state"""
+        ready_symbols = self.work_symbols.get_ready_symbols()
+        for entry, status_label, delete_btn, symbol, row_frame in self.entry_rows:
+            if symbol:
+                status = "✅" if ready_symbols.get(symbol, False) else "❌"
+                status_label.config(text=status)
