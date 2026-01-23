@@ -8,6 +8,7 @@ from Helpers.Order import Order, OrderState
 #from model import general_app
 from Services.polygon_service import polygon_service
 from Services.tws_service import create_tws_service, TWSService
+from Services.order_wait_service import wait_service
 
 class OrderFixerService:
     """
@@ -135,22 +136,37 @@ class OrderFixerService:
                 pass
 
         # ----------------------------
-        # 2. Option premium
+        # 2. Option premium (check stream first, then snapshot)
         # ----------------------------
         if getattr(order, "premium", None) is None:
             try:
-                
-                snap = self.tws.get_option_snapshot(
-                    order.symbol,
-                    order.expiry,
-                    order.strike,
-                    order.right,
-                )
-                mid = snap.get("mid") if snap else None
-                if mid and mid > 0:
-                    order.premium = mid
+                # ✅ FIX: Check streamed premium first (0ms latency)
+                streamed_premium = wait_service.get_streamed_premium(order)
+                if streamed_premium and streamed_premium > 0:
+                    order.premium = streamed_premium
                     changed = True
-            except Exception:
+                    logging.debug(
+                        f"[OrderFixerService] ✅ Using streamed premium for {order.symbol} "
+                        f"{order.expiry} {order.strike}{order.right}: {streamed_premium}"
+                    )
+                else:
+                    # Fallback to snapshot if stream not available
+                    snap = self.tws.get_option_snapshot(
+                        order.symbol,
+                        order.expiry,
+                        order.strike,
+                        order.right,
+                    )
+                    mid = snap.get("mid") if snap else None
+                    if mid and mid > 0:
+                        order.premium = mid
+                        changed = True
+                        logging.debug(
+                            f"[OrderFixerService] Using snapshot premium for {order.symbol} "
+                            f"{order.expiry} {order.strike}{order.right}: {mid}"
+                        )
+            except Exception as e:
+                logging.warning(f"[OrderFixerService] Error fetching premium: {e}")
                 pass
 
         # ----------------------------

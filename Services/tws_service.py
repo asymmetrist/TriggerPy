@@ -603,6 +603,21 @@ class TWSService(EWrapper, EClient):
                     conid = data.contract.conId
                     logging.info(f"[ResolveConId] ✅ Resolved conId={conid} "
                                  f"for {contract.symbol} in {elapsed:.2f}s")
+                    
+                    # ✅ FIX: Cache option conID after resolving (for future use)
+                    if contract.secType == "OPT":
+                        expiry = getattr(contract, 'lastTradeDateOrContractMonth', None)
+                        strike = getattr(contract, 'strike', None)
+                        right = getattr(contract, 'right', None)
+                        if expiry and strike is not None and right:
+                            storage.store_option_conid(
+                                contract.symbol, expiry, float(strike), right, str(conid)
+                            )
+                            logging.info(
+                                f"[ResolveConId] ✅ Cached option conID for {contract.symbol} "
+                                f"{expiry} {strike}{right} → {conid}"
+                            )
+                    
                     return conid
                 else:
                     logging.info(f"[ResolveConId] ⚠️ Empty data for {contract.symbol}, "

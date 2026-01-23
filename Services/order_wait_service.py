@@ -627,8 +627,8 @@ class OrderWaitService:
                 del self._premium_streams[key]
                 del self._premium_streams_by_req_id[req_id]
     
-    def _get_streamed_premium(self, order: Order) -> Optional[float]:
-        """Get premium from active stream (0ms latency) - returns None if stream not available"""
+    def get_streamed_premium(self, order: Order) -> Optional[float]:
+        """Get premium from active stream (0ms latency) - returns None if stream not available (PUBLIC API)"""
         key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
         
         with self._stream_lock:
@@ -1167,7 +1167,7 @@ class OrderWaitService:
             
             # If no premium, try stream first
             if not premium or premium <= 0:
-                premium = self._get_streamed_premium(order)
+                premium = self.get_streamed_premium(order)
             
             # If still no premium, fetch with retry
             if not premium or premium <= 0:
