@@ -97,6 +97,13 @@ class ArcTriggerApp(tk.Tk):
             text="Work Symbols",
             command=lambda: WorkSymbolsView(self)
         ).pack(side="left", padx=5)
+        
+        # Replay mode toggle
+        self.replay_mode = False
+        self.replay_service = None
+        ttk.Button(top_frame, text="🎬 Replay", command=self.toggle_replay_mode).pack(side="left", padx=5)
+        self.replay_status_label = ttk.Label(top_frame, text="", foreground="gray", background="black")
+        self.replay_status_label.pack(side="left", padx=5)
 
 
         # Removed: ttk.Button(top_frame, text="Finalized Orders", ...)
@@ -296,6 +303,10 @@ class ArcTriggerApp(tk.Tk):
         Performs a final autosave, stops background threads,
         and safely destroys the Tkinter root.
         """
+        # Stop replay if active
+        if self.replay_mode:
+            self._stop_replay_mode()
+        
         try:
             logging.info("[ArcTriggerApp.on_exit] Application exiting, performing final save...")
             runtime_man.stop()
@@ -391,6 +402,118 @@ class ArcTriggerApp(tk.Tk):
 
         tree.bind("<Button-1>", on_tree_click)
         refresh()
+    
+    # ------------------------------------------------------------------
+    #  REPLAY MODE
+    # ------------------------------------------------------------------
+    def toggle_replay_mode(self):
+        """Toggle replay mode on/off."""
+        if not self.replay_mode:
+            self._start_replay_mode()
+        else:
+            self._stop_replay_mode()
+    
+    def _start_replay_mode(self):
+        """Start replay mode - show dialog to configure replay."""
+        from tkinter import simpledialog, messagebox
+        
+        try:
+            # Get date
+            date = simpledialog.askstring(
+                "Replay Mode",
+                "Enter date to replay (YYYY-MM-DD):\n\nExample: 2026-01-22",
+                initialvalue="2026-01-22"
+            )
+            if not date:
+                return
+            
+            # Validate date format
+            from datetime import datetime
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showerror("Invalid Date", "Date must be in YYYY-MM-DD format")
+                return
+            
+            # Get symbol
+            symbol = simpledialog.askstring(
+                "Replay Mode",
+                "Enter symbol to replay:\n\nExample: TSLA",
+                initialvalue="TSLA"
+            )
+            if not symbol:
+                return
+            
+            # Get speed
+            speed_str = simpledialog.askstring(
+                "Replay Mode",
+                "Replay speed:\n1.0 = real-time\n2.0 = 2x speed\n10.0 = 10x speed",
+                initialvalue="1.0"
+            )
+            try:
+                speed = float(speed_str) if speed_str else 1.0
+                if speed <= 0:
+                    speed = 1.0
+            except:
+                speed = 1.0
+            
+            # Confirm
+            confirm = messagebox.askyesno(
+                "Start Replay?",
+                f"Start replay mode?\n\n"
+                f"Date: {date}\n"
+                f"Symbol: {symbol.upper()}\n"
+                f"Speed: {speed}x\n\n"
+                f"⚠️ Orders will be placed to your paper account!"
+            )
+            if not confirm:
+                return
+            
+            # Initialize replay service
+            from Replay.replay_service import ReplayService
+            
+            self.replay_service = ReplayService()
+            self.replay_mode = True
+            
+            # Start replay in background thread
+            def start_replay():
+                try:
+                    self.replay_service.start_replay(
+                        date=date,
+                        symbols=[symbol.upper()],
+                        speed=speed,
+                        order_mode="real"  # Use real TWS (paper account)
+                    )
+                except Exception as e:
+                    logging.error(f"[UI] Replay start error: {e}", exc_info=True)
+                    self.after(0, lambda: messagebox.showerror("Replay Error", f"Failed to start replay:\n{e}"))
+                    self.after(0, self._stop_replay_mode)
+            
+            threading.Thread(target=start_replay, daemon=True, name="ReplayThread").start()
+            
+            # Update UI
+            self.replay_status_label.config(
+                text=f"🎬 {symbol.upper()} on {date} ({speed}x)",
+                foreground="green"
+            )
+            logging.info(f"[UI] Replay mode started: {symbol.upper()} on {date} at {speed}x speed")
+            
+        except Exception as e:
+            logging.error(f"[UI] Replay setup error: {e}", exc_info=True)
+            messagebox.showerror("Replay Error", f"Failed to setup replay:\n{e}")
+    
+    def _stop_replay_mode(self):
+        """Stop replay mode."""
+        if self.replay_service:
+            try:
+                self.replay_service.stop_replay()
+            except Exception as e:
+                logging.error(f"[UI] Error stopping replay: {e}")
+            self.replay_service = None
+        
+        self.replay_mode = False
+        self.replay_status_label.config(text="", foreground="gray")
+        logging.info("[UI] Replay mode stopped")
 
 
     # ------------------------------------------------------------------
