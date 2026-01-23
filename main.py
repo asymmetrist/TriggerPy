@@ -444,6 +444,38 @@ class ArcTriggerApp(tk.Tk):
             if not symbol:
                 return
             
+            # Get start time
+            start_time_str = simpledialog.askstring(
+                "Replay Mode",
+                "Start time (HH:MM:SS ET):\n\nExamples:\n04:00:00 = Premarket start\n09:30:00 = Market open\n14:00:00 = Afternoon",
+                initialvalue="04:00:00"
+            )
+            if not start_time_str:
+                return
+            
+            # Validate start time format
+            try:
+                datetime.strptime(start_time_str, "%H:%M:%S")
+            except ValueError:
+                messagebox.showerror("Invalid Time", "Start time must be in HH:MM:SS format")
+                return
+            
+            # Get end time
+            end_time_str = simpledialog.askstring(
+                "Replay Mode",
+                "End time (HH:MM:SS ET):\n\nExamples:\n09:30:00 = Market open\n16:00:00 = Market close\n20:00:00 = After hours",
+                initialvalue="20:00:00"
+            )
+            if not end_time_str:
+                return
+            
+            # Validate end time format
+            try:
+                datetime.strptime(end_time_str, "%H:%M:%S")
+            except ValueError:
+                messagebox.showerror("Invalid Time", "End time must be in HH:MM:SS format")
+                return
+            
             # Get speed
             speed_str = simpledialog.askstring(
                 "Replay Mode",
@@ -463,6 +495,7 @@ class ArcTriggerApp(tk.Tk):
                 f"Start replay mode?\n\n"
                 f"Date: {date}\n"
                 f"Symbol: {symbol.upper()}\n"
+                f"Time: {start_time_str} - {end_time_str} ET\n"
                 f"Speed: {speed}x\n\n"
                 f"⚠️ Orders will be placed to your paper account!"
             )
@@ -481,6 +514,8 @@ class ArcTriggerApp(tk.Tk):
                     self.replay_service.start_replay(
                         date=date,
                         symbols=[symbol.upper()],
+                        start_time=start_time_str,
+                        end_time=end_time_str,
                         speed=speed,
                         order_mode="real"  # Use real TWS (paper account)
                     )
@@ -493,10 +528,10 @@ class ArcTriggerApp(tk.Tk):
             
             # Update UI
             self.replay_status_label.config(
-                text=f"🎬 {symbol.upper()} on {date} ({speed}x)",
+                text=f"🎬 {symbol.upper()} {date} {start_time_str}-{end_time_str} ({speed}x)",
                 foreground="green"
             )
-            logging.info(f"[UI] Replay mode started: {symbol.upper()} on {date} at {speed}x speed")
+            logging.info(f"[UI] Replay mode started: {symbol.upper()} on {date} from {start_time_str} to {end_time_str} at {speed}x speed")
             
         except Exception as e:
             logging.error(f"[UI] Replay setup error: {e}", exc_info=True)
