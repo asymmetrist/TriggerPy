@@ -124,12 +124,68 @@ class ArcTriggerApp(tk.Tk):
             logging.info("[ArcTriggerApp] Previous session auto-restored.")
         else:
             logging.info("[ArcTriggerApp] No recent session to restore.")
+        
+        # Auto-refresh work symbols if in premarket
+        self.after(2000, self._auto_refresh_work_symbols_if_premarket)  # Wait 2s for connection to establish
 
     
     def show_positions(self):
         from opmng_ui import open_positions_window
         open_positions_window(self)
 
+    def _auto_refresh_work_symbols_if_premarket(self):
+        """Auto-refresh work symbols conIDs if in premarket."""
+        from Services.nasdaq_info import is_market_closed_or_pre_market
+        from Services.work_symbols import work_symbols
+        from Services.tws_service import create_tws_service
+        
+        # Check if premarket
+        if not is_market_closed_or_pre_market():
+            logging.info("[ArcTriggerApp] Not in premarket - skipping auto-refresh")
+            return
+        
+        # Check TWS connection
+        tws_service = create_tws_service()
+        if not tws_service.is_connected():
+            logging.info("[ArcTriggerApp] TWS not connected - skipping auto-refresh")
+            return
+        
+        # Check if there are symbols to refresh
+        symbols = list(work_symbols.get_ready_symbols().keys())
+        if not symbols:
+            logging.info("[ArcTriggerApp] No symbols in Work Symbols - skipping auto-refresh")
+            return
+        
+        logging.info(f"[ArcTriggerApp] Premarket detected - auto-refreshing conIDs for {len(symbols)} symbol(s)")
+        
+        # Run refresh in background thread
+        def worker():
+            try:
+                from Services.option_conid_cache_service import cache_option_conids_for_all_symbols
+                from Services.polygon_service import polygon_service
+                from Services.persistent_conid_storage import storage
+                
+                # Step 1: Refresh stock conIDs
+                logging.info("[ArcTriggerApp] Auto-refresh: Refreshing stock conIDs...")
+                work_symbols.refresh_all_conids()
+                
+                # Step 2: Cache option conIDs
+                logging.info("[ArcTriggerApp] Auto-refresh: Caching option conIDs...")
+                results = cache_option_conids_for_all_symbols(
+                    tws_service, polygon_service, storage, num_strikes=10
+                )
+                
+                total_cached = sum(cached for cached, _ in results.values())
+                total_attempted = sum(attempted for _, attempted in results.values())
+                
+                logging.info(
+                    f"[ArcTriggerApp] Auto-refresh complete: "
+                    f"Stock conIDs refreshed, {total_cached}/{total_attempted} option conIDs cached"
+                )
+            except Exception as e:
+                logging.error(f"[ArcTriggerApp] Error in auto-refresh: {e}")
+        
+        threading.Thread(target=worker, daemon=True).start()
 
     def save_session(self, filename: str = "arctrigger.dat", background: bool = False):
         """
