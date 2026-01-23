@@ -63,19 +63,38 @@ class OrderWaitService:
                 logging.debug(f"[WaitService] Loop tick | order_id={order_id} | state={order.state}")
                 
                 # Order preparation check - should ideally be done before watcher starts
+                # ✅ FIX: Skip legacy preparation if model is None (pipeline handles it in _finalize_order)
                 if not order._order_ready:
                     logging.warning(f"[WaitService] Order not ready, preparing | order_id={order_id}")
                     model = order._model
                     _args = order._args
-                    _order = model.prepare_option_order(action= _args["action"]
-                                                        ,position=_args["position"]
-                                                        ,quantity=_args["quantity"]
-                                                        ,trigger_price=_args["trigger_price"]
-                                                        ,arcTick=_args["arcTick"]
-                                                        ,type="LMT"
-                                                        ,status_callback=_args["status_callback"])
-                    order = _order
-                    logging.info(f"[WaitService] Order prepared in watcher | order_id={order_id}")
+                    
+                    # ✅ Check if model exists before using it
+                    if model is None:
+                        logging.warning(f"[WaitService] Order model is None - skipping preparation (pipeline will handle) | order_id={order_id}")
+                        # Pipeline will handle premium fetching at trigger time
+                        # Just mark as ready to proceed with monitoring
+                        order._order_ready = True
+                    elif _args and "action" in _args:
+                        try:
+                            _order = model.prepare_option_order(
+                                action=_args["action"],
+                                position=_args["position"],
+                                quantity=_args["quantity"],
+                                trigger_price=_args["trigger_price"],
+                                arcTick=_args["arcTick"],
+                                type="LMT",
+                                status_callback=_args["status_callback"]
+                            )
+                            order = _order
+                            logging.info(f"[WaitService] Order prepared in watcher | order_id={order_id}")
+                        except Exception as e:
+                            logging.error(f"[WaitService] Failed to prepare order in watcher | order_id={order_id} | error={e}")
+                            # Continue anyway - pipeline will handle it
+                            order._order_ready = True
+                    else:
+                        logging.warning(f"[WaitService] Order args missing - skipping preparation | order_id={order_id}")
+                        order._order_ready = True
 
                 # Consolidated lock check
                 with self.lock:
@@ -438,12 +457,25 @@ class OrderWaitService:
         # ✅ IMMEDIATE TRIGGER CHECK (after stream started)
         current_price = self.polygon.get_last_trade(order.symbol)
         if current_price and order.is_triggered(current_price):
-            logging.info(
-                f"[WaitService] 🚨 TRIGGER ALREADY MET! Executing immediately. "
-                f"Current: {current_price}, Trigger: {order.trigger}"
-            )
-            self._finalize_order(order_id, order, tinfo=None, last_price=current_price)
-            return order_id
+            # ✅ Check if premarket - if so, show rebase popup instead of finalizing
+            if is_market_closed_or_pre_market():
+                logging.info(
+                    f"[WaitService] 🚨 TRIGGER MET IN PREMARKET! Showing rebase popup. "
+                    f"Current: {current_price}, Trigger: {order.trigger}"
+                )
+                # Create a dummy ThreadInfo for the popup
+                tinfo = ThreadInfo(order_id, order.symbol, watcher_type="trigger", mode="poll")
+                watcher_info.add_watcher(tinfo)
+                self._handle_premarket_trigger(order_id, order, tinfo, current_price)
+                # Don't return - continue to start watcher so it can trigger again after rebase
+            else:
+                # RTH - fire immediately
+                logging.info(
+                    f"[WaitService] 🚨 TRIGGER ALREADY MET! Executing immediately. "
+                    f"Current: {current_price}, Trigger: {order.trigger}"
+                )
+                self._finalize_order(order_id, order, tinfo=None, last_price=current_price)
+                return order_id
 
         # Subscribe / start poller only if trigger not already met
         self.start_trigger_watcher(order, mode) # 💡 Simplified to use the router
