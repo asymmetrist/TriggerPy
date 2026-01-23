@@ -97,11 +97,6 @@ class ArcTriggerApp(tk.Tk):
             text="Work Symbols",
             command=lambda: WorkSymbolsView(self)
         ).pack(side="left", padx=5)
-        ttk.Button(
-            top_frame,
-            text="Cache Option ConIDs",
-            command=self.cache_option_conids
-        ).pack(side="left", padx=5)
 
 
         # Removed: ttk.Button(top_frame, text="Finalized Orders", ...)
@@ -134,70 +129,6 @@ class ArcTriggerApp(tk.Tk):
     def show_positions(self):
         from opmng_ui import open_positions_window
         open_positions_window(self)
-
-    def cache_option_conids(self):
-        """Cache option conIDs for all symbols in Work Symbols."""
-        from tkinter import messagebox
-        from Services.option_conid_cache_service import cache_option_conids_for_all_symbols
-        from Services.persistent_conid_storage import storage
-        from Services.polygon_service import polygon_service
-        from Services.tws_service import create_tws_service
-        
-        # Check TWS connection
-        tws_service = create_tws_service()
-        if not tws_service.is_connected():
-            messagebox.showerror("Error", "TWS not connected. Please connect first.")
-            return
-        
-        # Check if there are symbols to cache
-        from Services.work_symbols import work_symbols
-        symbols = list(work_symbols.get_ready_symbols().keys())
-        if not symbols:
-            messagebox.showwarning("Warning", "No symbols in Work Symbols. Please add symbols first.")
-            return
-        
-        # Show confirmation
-        response = messagebox.askyesno(
-            "Cache Option ConIDs",
-            f"Cache option conIDs for {len(symbols)} symbol(s)?\n\n"
-            f"This will cache conIDs for this week's Friday expiry (±10 strikes, CALL & PUT)\n"
-            f"for: {', '.join(symbols[:5])}{'...' if len(symbols) > 5 else ''}\n\n"
-            f"This may take a few minutes."
-        )
-        
-        if not response:
-            return
-        
-        # Run in background thread to avoid blocking UI
-        def worker():
-            try:
-                logging.info("[ArcTriggerApp] Starting option conID cache...")
-                results = cache_option_conids_for_all_symbols(
-                    tws_service, polygon_service, storage, num_strikes=10
-                )
-                
-                # Show results
-                total_cached = sum(cached for cached, _ in results.values())
-                total_attempted = sum(attempted for _, attempted in results.values())
-                
-                def show_results():
-                    messagebox.showinfo(
-                        "Cache Complete",
-                        f"Cached {total_cached}/{total_attempted} option conIDs\n\n"
-                        f"Symbols processed: {len(symbols)}\n"
-                        f"Success rate: {(total_cached/total_attempted*100) if total_attempted > 0 else 0:.1f}%"
-                    )
-                
-                self.after(0, show_results)
-                logging.info(f"[ArcTriggerApp] Option conID cache complete: {total_cached}/{total_attempted}")
-            except Exception as e:
-                logging.error(f"[ArcTriggerApp] Error caching option conIDs: {e}")
-                def show_error():
-                    messagebox.showerror("Error", f"Failed to cache option conIDs:\n{str(e)}")
-                self.after(0, show_error)
-        
-        threading.Thread(target=worker, daemon=True).start()
-        logging.info("[ArcTriggerApp] Option conID cache started in background thread")
 
 
     def save_session(self, filename: str = "arctrigger.dat", background: bool = False):

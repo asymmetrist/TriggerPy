@@ -56,7 +56,7 @@ class WorkSymbolsView(tk.Toplevel):
         bottom.pack(fill="x", padx=10, pady=10)
 
         ttk.Button(bottom, text="Remove Selected", command=self._remove_selected).pack(side="left")
-        ttk.Button(bottom, text="Refresh ConIDs", command=self._refresh_conids).pack(side="left", padx=10)
+        ttk.Button(bottom, text="Refresh All ConIDs", command=self._refresh_conids).pack(side="left", padx=10)
         ttk.Button(bottom, text="Close", command=self.destroy).pack(side="right")
 
     # -------------------------------------------------
@@ -104,9 +104,66 @@ class WorkSymbolsView(tk.Toplevel):
             messagebox.showerror("Error", "TWS not connected")
             return
 
+        symbols = list(self.work_symbols.get_ready_symbols().keys())
+        if not symbols:
+            messagebox.showwarning("Warning", "No symbols to refresh. Please add symbols first.")
+            return
+
+        # Show confirmation
+        response = messagebox.askyesno(
+            "Refresh All ConIDs",
+            f"Refresh stock and option conIDs for {len(symbols)} symbol(s)?\n\n"
+            f"This will:\n"
+            f"1. Refresh stock conIDs\n"
+            f"2. Cache option conIDs (Friday expiry, ±10 strikes, CALL & PUT)\n\n"
+            f"Symbols: {', '.join(symbols[:5])}{'...' if len(symbols) > 5 else ''}\n\n"
+            f"This may take a few minutes."
+        )
+
+        if not response:
+            return
+
         def worker():
-            self.work_symbols.refresh_all_conids()
-            self.after(0, self._refresh_list)
+            try:
+                from Services.option_conid_cache_service import cache_option_conids_for_all_symbols
+                from Services.polygon_service import polygon_service
+                from Services.tws_service import create_tws_service
+                
+                tws_service = create_tws_service()
+                
+                # Step 1: Refresh stock conIDs
+                logging.info("[WorkSymbolsView] Step 1: Refreshing stock conIDs...")
+                self.work_symbols.refresh_all_conids()
+                
+                # Step 2: Cache option conIDs
+                logging.info("[WorkSymbolsView] Step 2: Caching option conIDs...")
+                results = cache_option_conids_for_all_symbols(
+                    tws_service, polygon_service, self.storage, num_strikes=10
+                )
+                
+                # Calculate totals
+                total_cached = sum(cached for cached, _ in results.values())
+                total_attempted = sum(attempted for _, attempted in results.values())
+                
+                # Update UI and show results
+                def update_ui():
+                    self._refresh_list()
+                    messagebox.showinfo(
+                        "Refresh Complete",
+                        f"✅ Stock conIDs refreshed\n"
+                        f"✅ Option conIDs cached: {total_cached}/{total_attempted}\n\n"
+                        f"Symbols processed: {len(symbols)}\n"
+                        f"Success rate: {(total_cached/total_attempted*100) if total_attempted > 0 else 0:.1f}%"
+                    )
+                
+                self.after(0, update_ui)
+                logging.info(f"[WorkSymbolsView] Refresh complete: {total_cached}/{total_attempted} option conIDs cached")
+            except Exception as e:
+                logging.error(f"[WorkSymbolsView] Error refreshing conIDs: {e}")
+                def show_error():
+                    messagebox.showerror("Error", f"Failed to refresh conIDs:\n{str(e)}")
+                    self._refresh_list()  # Still refresh the list even if there was an error
+                self.after(0, show_error)
 
         threading.Thread(target=worker, daemon=True).start()
 
