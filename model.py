@@ -570,19 +570,40 @@ class AppModel:
     type: str = "LMT",
     status_callback=None,
 ) -> Order:
+        import time
+        prep_start = time.time()
+        
+        logging.info(
+            f"[ORDER_PREP] Starting order preparation | symbol={self._symbol} | "
+            f"expiry={self._expiry} strike={self._strike} right={self._right} | "
+            f"trigger={trigger_price} position=${position} | timestamp={prep_start:.3f}"
+        )
 
         # --- 0. normalize expiry ---
         self._expiry = align_expiry_to_friday(self._expiry)
+        logging.debug(f"[ORDER_PREP] Expiry normalized: {self._expiry}")
 
         if not all([self._symbol, self._expiry, self._strike, self._right]):
-            raise ValueError("Option parameters not set")
+            error_msg = "Option parameters not set"
+            logging.error(f"[ORDER_PREP] ❌ {error_msg} | symbol={self._symbol} expiry={self._expiry} strike={self._strike} right={self._right}")
+            raise ValueError(error_msg)
 
         # --- 1. underlying price (SLOW) ---
+        logging.info(f"[ORDER_PREP] Fetching underlying price for {self._symbol}...")
+        price_start = time.time()
         current_price = self.refresh_market_price()
+        price_latency = (time.time() - price_start) * 1000
+        
         if not current_price:
-            raise ValueError("Underlying price unavailable")
+            error_msg = "Underlying price unavailable"
+            logging.error(f"[ORDER_PREP] ❌ {error_msg} | symbol={self._symbol} | latency={price_latency:.1f}ms")
+            raise ValueError(error_msg)
+        
+        logging.info(f"[ORDER_PREP] ✅ Underlying price: ${current_price:.2f} | latency={price_latency:.1f}ms")
 
         if not self._validate_breakout_trigger(trigger_price, current_price):
+            error_msg = f"Invalid breakout trigger: {trigger_price} vs current: {current_price}"
+            logging.error(f"[ORDER_PREP] ❌ {error_msg}")
             raise ValueError("Invalid breakout trigger")
 
         # --- 2. Premium fetching removed - will be done at RTH open in _finalize_order() with retry logic ---
@@ -606,14 +627,38 @@ class AppModel:
         )
         order.set_position_size(float(position))
         order._order_ready = False  # Mark as not ready - premium will be fetched at RTH open
+        
+        logging.info(
+            f"[ORDER_PREP] ✅ Order created | order_id={order.order_id} | "
+            f"symbol={self._symbol} {self._expiry} {self._strike}{self._right} | "
+            f"trigger={trigger_price} SL={sl} TP={tp} position=${position}"
+        )
 
         # --- 6. attach callback EARLY ---
         cb = status_callback or self._status_callback
         if cb:
             order.set_status_callback(cb)
+            logging.debug(f"[ORDER_PREP] Status callback attached")
 
         # --- 7. resolve IB contract (SLOW) ---
-        general_app.pre_conid(order)
+        logging.info(f"[ORDER_PREP] Resolving conID for {self._symbol} {self._expiry} {self._strike}{self._right}...")
+        conid_start = time.time()
+        conid_success = general_app.pre_conid(order)
+        conid_latency = (time.time() - conid_start) * 1000
+        
+        if conid_success:
+            logging.info(
+                f"[ORDER_PREP] ✅ ConID resolved | conID={getattr(order, '_pre_conid', None)} | "
+                f"latency={conid_latency:.1f}ms"
+            )
+        else:
+            logging.warning(f"[ORDER_PREP] ⚠️ ConID resolution failed | latency={conid_latency:.1f}ms")
+        
+        prep_total = (time.time() - prep_start) * 1000
+        logging.info(
+            f"[ORDER_PREP] ✅ Order preparation complete | order_id={order.order_id} | "
+            f"total_time={prep_total:.1f}ms | price_fetch={price_latency:.1f}ms conid={conid_latency:.1f}ms"
+        )
 
         return order
 

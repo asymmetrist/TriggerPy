@@ -210,10 +210,10 @@ class TWSService(EWrapper, EClient):
                             if stream:
                                 if tickType == 1:  # BID
                                     stream["bid"] = price
-                                    logging.info(f"[TWSService] ✅ Stream BID update: reqId={reqId} price={price}")
+                                    logging.info(f"[TWSService] ✅ Stream BID update: reqId={reqId} price={price:.4f} | timestamp={time.time():.3f}")
                                 elif tickType == 2:  # ASK
                                     stream["ask"] = price
-                                    logging.info(f"[TWSService] ✅ Stream ASK update: reqId={reqId} price={price}")
+                                    logging.info(f"[TWSService] ✅ Stream ASK update: reqId={reqId} price={price:.4f} | timestamp={time.time():.3f}")
                                 
                                 # Calculate mid when both available
                                 bid = stream.get("bid")
@@ -221,7 +221,11 @@ class TWSService(EWrapper, EClient):
                                 if bid is not None and ask is not None and bid > 0 and ask > 0:
                                     stream["mid"] = (bid + ask) / 2
                                     stream["last_update"] = time.time()
-                                    logging.info(f"[TWSService] ✅ Stream MID calculated: reqId={reqId} bid={bid} ask={ask} mid={stream['mid']}")
+                                    logging.info(
+                                        f"[TWSService] ✅ Stream MID calculated: reqId={reqId} | "
+                                        f"bid={bid:.4f} ask={ask:.4f} mid={stream['mid']:.4f} | "
+                                        f"timestamp={time.time():.3f}"
+                                    )
                         return  # Handled by stream
         except (ImportError, AttributeError, KeyError) as e:
             # Log error for debugging
@@ -277,23 +281,39 @@ class TWSService(EWrapper, EClient):
     self, orderId, status, filled, remaining, avgFillPrice,
     permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice
 ):
-        logging.info(f"[TWSService] orderStatus entry – orderId={orderId} status={status} filled={filled}")
+        import time
+        status_ts = time.time() * 1000
+        
+        logging.info(
+            f"[ORDER_STATUS] Received | IB_orderId={orderId} | status={status} | "
+            f"filled={filled} remaining={remaining} avgFillPrice={avgFillPrice} | "
+            f"timestamp={status_ts:.0f}ms"
+        )
+        
         custom_uuid = self._ib_to_custom_id.get(orderId)
         if not custom_uuid:
-            logging.info(f"[TWSService] orderStatus – no custom_uuid mapping for IB orderId={orderId}")
+            logging.warning(
+                f"[ORDER_STATUS] ⚠️ No custom_uuid mapping | IB_orderId={orderId} | "
+                f"status={status}"
+            )
             return
 
         status_str = status.lower()
         pos = self._positions_by_order_id.get(custom_uuid)
 
         if not pos:
-            logging.info(f"[TWSService] orderStatus – no position cached for custom_uuid={custom_uuid}")
+            logging.warning(
+                f"[ORDER_STATUS] ⚠️ No position cached | order_id={custom_uuid} | "
+                f"IB_orderId={orderId} status={status}"
+            )
             return
 
         # ✅ ONLY SOURCE OF TRUTH FOR QTY
+        old_qty = pos.get("qty", 0)
         if filled is not None:
             pos["qty"] = int(filled)
 
+        old_avg = pos.get("avg_price")
         if avgFillPrice:
             pos["avg_price"] = float(avgFillPrice)
 
@@ -301,25 +321,38 @@ class TWSService(EWrapper, EClient):
         self._positions_by_order_id[custom_uuid] = pos
 
         logging.info(
-            f"[TWSService] orderStatus update {custom_uuid}: "
-            f"status={status_str} qty={pos['qty']} avg={pos.get('avg_price')}"
+            f"[ORDER_STATUS] Updated | order_id={custom_uuid} IB_orderId={orderId} | "
+            f"status={status_str} | qty: {old_qty} → {pos['qty']} | "
+            f"avg_price: {old_avg} → {pos.get('avg_price')}"
         )
         
         # ✅ FIX: When order is Filled, set fill event and mark as finalized
         if status_str == "filled":
             order = self._pending_orders.get(custom_uuid)
             if order:
+                logging.info(
+                    f"[ORDER_STATUS] 🎉 ORDER FILLED | order_id={custom_uuid} | "
+                    f"IB_orderId={orderId} | filled={filled} avgFillPrice={avgFillPrice} | "
+                    f"timestamp={status_ts:.0f}ms"
+                )
+                
                 # Set fill event so order_wait_service can proceed
                 if hasattr(order, "_fill_event"):
                     order._fill_event.set()
-                    logging.info(f"[TWSService] Set fill event for order {custom_uuid}")
+                    logging.info(
+                        f"[ORDER_STATUS] Fill event set | order_id={custom_uuid} | "
+                        f"IB_orderId={orderId}"
+                    )
                 
                 # Mark order as finalized
                 from Helpers.Order import OrderState
                 if order.state != OrderState.FINALIZED:
                     result = f"IB Order ID: {orderId}, Filled: {filled}, Avg Price: {avgFillPrice}"
                     order.mark_finalized(result)
-                    logging.info(f"[TWSService] Marked order {custom_uuid} as FINALIZED")
+                    logging.info(
+                        f"[ORDER_STATUS] ✅ Order marked FINALIZED | order_id={custom_uuid} | "
+                        f"IB_orderId={orderId} | result={result}"
+                    )
                     
                     # ✅ Also add to finalized_orders immediately so TP buttons work right away
                     from Services.order_manager import order_manager
@@ -537,13 +570,24 @@ class TWSService(EWrapper, EClient):
 
     def resolve_conid(self, contract: Contract, timeout: int = 10) -> Optional[int]:
         """Resolve contract to conId"""
-        logging.info(f"[TWSService] resolve_conid() – contract={contract.symbol} secType={getattr(contract, 'secType', '?')}")
+        import time
+        resolve_start = time.time() * 1000
+        
+        logging.info(
+            f"[RESOLVE_CONID] Starting resolution | symbol={contract.symbol} | "
+            f"secType={getattr(contract, 'secType', '?')} | timeout={timeout}s | "
+            f"timestamp={resolve_start:.0f}ms"
+        )
         
         # Check cache for STOCK contracts
         if contract.secType == "STK":
             conid = storage.get_conid(contract.symbol) 
             if conid != None:
-                logging.info(f"[TWSService] using stored STOCK conid at resolve_conid({contract.symbol})")
+                latency = time.time() * 1000 - resolve_start
+                logging.info(
+                    f"[RESOLVE_CONID] ✅ STOCK cache hit | symbol={contract.symbol} → conID={conid} | "
+                    f"latency={latency:.1f}ms (from DB cache)"
+                )
                 return int(conid)
         
         # ✅ NEW: Check cache for OPTION contracts (hybrid approach)
@@ -556,23 +600,37 @@ class TWSService(EWrapper, EClient):
                     contract.symbol, expiry, float(strike), right
                 )
                 if cached_conid:
-                    logging.info(f"[TWSService] ✅ Using cached OPTION conid for {contract.symbol} {expiry} {strike}{right} → {cached_conid} (0ms)")
+                    latency = time.time() * 1000 - resolve_start
+                    logging.info(
+                        f"[RESOLVE_CONID] ✅ OPTION cache hit | {contract.symbol} {expiry} {strike}{right} → conID={cached_conid} | "
+                        f"latency={latency:.1f}ms (from DB cache)"
+                    )
                     return int(cached_conid)
                 else:
-                    logging.debug(f"[TWSService] No cached OPTION conid for {contract.symbol} {expiry} {strike}{right}, resolving from TWS")
+                    logging.debug(
+                        f"[RESOLVE_CONID] OPTION cache miss | {contract.symbol} {expiry} {strike}{right} | "
+                        f"resolving from TWS..."
+                    )
         
         # For contracts not in cache, resolve fresh from TWS
         if not self.is_connected():
+            latency = time.time() * 1000 - resolve_start
+            logging.error(
+                f"[RESOLVE_CONID] ❌ TWS not connected | symbol={contract.symbol} | "
+                f"latency={latency:.1f}ms"
+            )
             return None
 
         req_id = self._get_next_req_id()
         event = threading.Event()
         self._contract_details[req_id] = {"event": event, "details": None}
 
-        logging.info(f"[ResolveConId] Starting for {contract.symbol} "
-                 f"{getattr(contract, 'lastTradeDateOrContractMonth', '?')} "
-                 f"{getattr(contract, 'strike', '?')}{getattr(contract, 'right', '?')} "
-                 f"(req_id={req_id}, timeout={timeout}s)")
+        logging.info(
+            f"[RESOLVE_CONID] Requesting from TWS | symbol={contract.symbol} "
+            f"{getattr(contract, 'lastTradeDateOrContractMonth', '?')} "
+            f"{getattr(contract, 'strike', '?')}{getattr(contract, 'right', '?')} | "
+            f"req_id={req_id} timeout={timeout}s | timestamp={time.time()*1000:.0f}ms"
+        )
 
 
         def on_contract_details(reqId, contractDetails):
@@ -597,12 +655,23 @@ class TWSService(EWrapper, EClient):
             self.reqContractDetails(req_id, contract)
             if event.wait(timeout):
                 elapsed = time.time() - start_time
-                logging.info(f"[ResolveConId] Callback received for {contract.symbol} after {elapsed:.2f}s")
+                elapsed_ms = elapsed * 1000
+                total_latency = time.time() * 1000 - resolve_start
+                
+                logging.info(
+                    f"[RESOLVE_CONID] ✅ Callback received | symbol={contract.symbol} | "
+                    f"req_id={req_id} | elapsed={elapsed:.2f}s ({elapsed_ms:.1f}ms) | "
+                    f"total_latency={total_latency:.1f}ms"
+                )
+                
                 data = self._contract_details[req_id]["details"]
                 if data:
                     conid = data.contract.conId
-                    logging.info(f"[ResolveConId] ✅ Resolved conId={conid} "
-                                 f"for {contract.symbol} in {elapsed:.2f}s")
+                    logging.info(
+                        f"[RESOLVE_CONID] ✅ RESOLVED | symbol={contract.symbol} | "
+                        f"conID={conid} | elapsed={elapsed:.2f}s ({elapsed_ms:.1f}ms) | "
+                        f"total_latency={total_latency:.1f}ms"
+                    )
                     
                     # ✅ FIX: Cache option conID after resolving (for future use)
                     if contract.secType == "OPT":
@@ -767,7 +836,15 @@ class TWSService(EWrapper, EClient):
         Pre-resolve conId BEFORE order placement.
         Useful for pre-market where we want everything ready.
         """
-        logging.info(f"[TWSSwervice] doing pre-conid for order: {custom_order}")
+        import time
+        start_ts = time.time() * 1000
+        
+        logging.info(
+            f"[CONID] Starting pre_conid resolution | order_id={custom_order.order_id} | "
+            f"symbol={custom_order.symbol} {custom_order.expiry} {custom_order.strike}{custom_order.right} | "
+            f"timestamp={start_ts:.0f}ms"
+        )
+        
         try:
             key = (
                 custom_order.symbol.upper(),
@@ -780,10 +857,15 @@ class TWSService(EWrapper, EClient):
             if key in self._pre_conid_cache:
                 conid = self._pre_conid_cache[key]
                 custom_order._pre_conid = conid
-                logging.info(f"[TWSService] pre_conid CACHE HIT {key} → {conid}")
+                latency = time.time() * 1000 - start_ts
+                logging.info(
+                    f"[CONID] ✅ CACHE HIT | order_id={custom_order.order_id} | "
+                    f"key={key} → conID={conid} | latency={latency:.1f}ms (0ms from cache)"
+                )
                 return True
 
             # 2. Build contract
+            logging.debug(f"[CONID] Building contract for {key}")
             contract = self.create_option_contract(
                 symbol=custom_order.symbol,
                 last_trade_date=custom_order.expiry,
@@ -792,22 +874,37 @@ class TWSService(EWrapper, EClient):
             )
 
             # 3. Resolve it
+            logging.info(f"[CONID] Resolving conID from TWS (cache miss) | order_id={custom_order.order_id}")
+            resolve_start = time.time() * 1000
             conid = self.resolve_conid(contract)
+            resolve_latency = time.time() * 1000 - resolve_start
+            
             if not conid:
-                logging.error(f"[TWSService] pre_conid FAILED {key}")
+                total_latency = time.time() * 1000 - start_ts
+                logging.error(
+                    f"[CONID] ❌ FAILED | order_id={custom_order.order_id} | "
+                    f"key={key} | resolve_latency={resolve_latency:.1f}ms | total={total_latency:.1f}ms"
+                )
                 return False
 
             # 4. Save to cache
             self._pre_conid_cache[key] = conid
             custom_order._pre_conid = conid
-
-            logging.info(f"[TWSService] pre_conid READY {key} → {conid}")
+            
+            total_latency = time.time() * 1000 - start_ts
+            logging.info(
+                f"[CONID] ✅ RESOLVED | order_id={custom_order.order_id} | "
+                f"key={key} → conID={conid} | resolve_latency={resolve_latency:.1f}ms | "
+                f"total={total_latency:.1f}ms | cached=True"
+            )
             return True
 
         except Exception as e:
-            logging.error(f"[TWSService] pre_conid ERROR {e}")
-
-
+            total_latency = time.time() * 1000 - start_ts
+            logging.error(
+                f"[CONID] ❌ ERROR | order_id={getattr(custom_order, 'order_id', '?')} | "
+                f"error={e} | total_latency={total_latency:.1f}ms"
+            )
             return False
         
 
@@ -824,14 +921,25 @@ class TWSService(EWrapper, EClient):
         """
         Place an order using your custom Order object from Helpers.Order.
         """
-        logging.info(f"[TWSService] place_custom_order – order_id={custom_order.order_id}")
+        import time
+        place_start = time.time() * 1000
+        
+        logging.info(
+            f"[TWS_PLACE] Starting order placement | order_id={custom_order.order_id} | "
+            f"symbol={custom_order.symbol} {custom_order.expiry} {custom_order.strike}{custom_order.right} | "
+            f"timestamp={place_start:.0f}ms"
+        )
+        
         if not self.is_connected():
-            logging.error(f"Cannot place order: Not connected to TWS")
+            logging.error(
+                f"[TWS_PLACE] ❌ TWS not connected | order_id={custom_order.order_id}"
+            )
             return False
 
         try:
             # Convert your custom order to IB contract
-
+            contract_start = time.time() * 1000
+            
             logging.info(
                 "[ORDER_INTENT] "
                 f"ts={time.time()*1000:.0f} order_id={custom_order.order_id} "
@@ -881,7 +989,13 @@ class TWSService(EWrapper, EClient):
             # ✅ SAFETY CHECK: Ensure entry_price is set
             if base_price is None or base_price <= 0:
                 error_msg = f"Order {custom_order.order_id} has invalid entry_price: {base_price}. Order must be finalized first."
-                logging.error(f"[TWSService] {error_msg}")
+                contract_latency = time.time() * 1000 - contract_start
+                total_latency = time.time() * 1000 - place_start
+                logging.error(
+                    f"[TWS_PLACE] ❌ Invalid entry_price | order_id={custom_order.order_id} | "
+                    f"entry_price={base_price} | contract_latency={contract_latency:.1f}ms | "
+                    f"total={total_latency:.1f}ms"
+                )
                 raise ValueError(error_msg)
 
             # ✅ FIXED QTY CALC
@@ -953,26 +1067,46 @@ class TWSService(EWrapper, EClient):
                         )
             self._pending_orders[custom_order.order_id] = custom_order
             
-
+            submit_start = time.time() * 1000
+            logging.info(
+                f"[TWS_PLACE] Submitting to TWS | order_id={custom_order.order_id} | "
+                f"IB_order_id={ib_order_id} | symbol={custom_order.symbol} | "
+                f"entry_price={base_price} qty={custom_order.qty} type={custom_order.type} | "
+                f"timestamp={submit_start:.0f}ms"
+            )
+            
             self.placeOrder(ib_order_id, contract, ib_order)
             custom_order._placed_ts = time.time() * 1000
+            submit_latency = custom_order._placed_ts - submit_start
+            total_latency = custom_order._placed_ts - place_start
+            
             logging.info(
-            "[ORDER_SENT] "
-            f"ts={custom_order._placed_ts:.0f} order_id={custom_order.order_id} "
-            f"ib_order_id={ib_order_id} qty={custom_order.qty}"
-        )
-
-
-            logging.info(f"[TWSService] Sent order {custom_order.symbol} IBID={ib_order_id} "
-                        f"at {custom_order._placed_ts:.0f} ms")
-            logging.info(f"Placed custom order: {custom_order.order_id} -> IB ID: {ib_order_id}")
+                f"[TWS_PLACE] ✅ Order submitted to TWS | order_id={custom_order.order_id} | "
+                f"IB_order_id={ib_order_id} | submit_latency={submit_latency:.1f}ms | "
+                f"total_latency={total_latency:.1f}ms | timestamp={custom_order._placed_ts:.0f}ms"
+            )
+            
+            logging.info(
+                "[ORDER_SENT] "
+                f"ts={custom_order._placed_ts:.0f} order_id={custom_order.order_id} "
+                f"ib_order_id={ib_order_id} qty={custom_order.qty}"
+            )
 
             # Increment order ID for next use
             self.next_valid_order_id += 1
+            total_latency = time.time() * 1000 - place_start
+            logging.info(
+                f"[TWS_PLACE] ✅ Order placement complete | order_id={custom_order.order_id} | "
+                f"IB_order_id={ib_order_id} | total_latency={total_latency:.1f}ms"
+            )
             return True
 
         except Exception as e:
-            logging.error(f"Failed to place custom order {custom_order.order_id}: {str(e)}")
+            total_latency = time.time() * 1000 - place_start
+            logging.exception(
+                f"[TWS_PLACE] ❌ EXCEPTION | order_id={custom_order.order_id} | "
+                f"error={str(e)} | total_latency={total_latency:.1f}ms"
+            )
             custom_order.mark_failed(reason=str(e))
             return False
 
