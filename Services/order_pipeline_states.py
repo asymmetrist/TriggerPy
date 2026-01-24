@@ -16,7 +16,9 @@ from Services.watcher_info import (
     ThreadInfo, watcher_info,
     STATUS_PENDING, STATUS_RUNNING, STATUS_FINALIZED, STATUS_FAILED
 )
-from Services.nasdaq_info import is_market_closed_or_pre_market
+from Services.nasdaq_info import is_market_closed_or_pre_market, is_market_open
+from datetime import datetime
+import pytz
 
 
 class PipelineState(Enum):
@@ -61,7 +63,14 @@ class PendingState(OrderPipelineState):
     """Initial state - order is pending finalization"""
     
     def execute(self) -> Optional[OrderPipelineState]:
-        self.log("Order pending finalization")
+        import time
+        state_start = time.time() * 1000
+        
+        self.log(
+            f"Order pending finalization | symbol={self.order.symbol} | "
+            f"entry_price={getattr(self.order, 'entry_price', None)} | "
+            f"timestamp={state_start:.0f}ms"
+        )
         
         # Check if we're in RTH
         if is_market_closed_or_pre_market():
@@ -72,10 +81,16 @@ class PendingState(OrderPipelineState):
         
         # Check if entry_price is already set
         if self.order.entry_price and self.order.entry_price > 0:
-            self.log("Entry price already set, skipping to placing")
+            latency = time.time() * 1000 - state_start
+            self.log(
+                f"Entry price already set ({self.order.entry_price}), skipping to placing | "
+                f"latency={latency:.1f}ms"
+            )
             return PlacingState(self.order, self.context)
         
         # Need to fetch premium and calculate
+        latency = time.time() * 1000 - state_start
+        self.log(f"Need to fetch premium and calculate | latency={latency:.1f}ms")
         return PremiumFetchingState(self.order, self.context)
     
     def get_state_name(self) -> str:
@@ -89,28 +104,66 @@ class PremiumFetchingState(OrderPipelineState):
         super().__init__(order, context)
         self.retry_count = retry_count
         self.max_retries = 3
-        self.max_wait = 1.0  # seconds
+        
+        # ✅ FIX: Longer wait time at market open when NBBO might not be available yet
+        if self._is_near_market_open():
+            self.max_wait = 2.0  # 2 seconds at market open (reduced from 5s for faster execution)
+            self.log("Market just opened - using extended wait time for NBBO", "info")
+        else:
+            self.max_wait = 1.0  # 1 second normally
+        
         self.wait_interval = 0.05
+    
+    def _is_near_market_open(self) -> bool:
+        """Check if we're within 10 seconds of market open (9:30 AM ET)"""
+        try:
+            EASTERN = pytz.timezone("US/Eastern")
+            now = datetime.now(EASTERN)
+            
+            # Check if market is open
+            if not is_market_open(now):
+                return False
+            
+            # Check if we're within 10 seconds of 9:30 AM (reduced for faster execution)
+            from datetime import time as dt_time
+            market_open_time = datetime.combine(now.date(), dt_time(9, 30), tzinfo=EASTERN)
+            time_since_open = (now - market_open_time).total_seconds()
+            
+            return 0 <= time_since_open <= 10  # Within first 10 seconds
+        except Exception:
+            return False  # Safe fallback
     
     def execute(self) -> Optional[OrderPipelineState]:
         self.log(f"Fetching premium (attempt {self.retry_count + 1}/{self.max_retries})")
         
         # Try to get premium from order (set by OrderFixerService)
         premium = getattr(self.order, "premium", None)
+        if premium and premium > 0:
+            self.log(f"✅ Premium from OrderFixerService: {premium}")
         
         # If no premium, try stream
         if not premium or premium <= 0:
+            self.log("Checking premium stream...")
             premium = self.context.wait_service.get_streamed_premium(self.order)
+            if premium and premium > 0:
+                self.log(f"✅ Premium from stream (immediate): {premium}")
         
-        # If still no premium, wait for stream
+        # If still no premium, wait for stream with detailed logging
         if not premium or premium <= 0:
-            self.log("Premium not available from stream, waiting...")
+            self.log(f"Premium not available from stream, waiting up to {self.max_wait}s...")
             waited = 0
+            check_count = 0
             
             while waited < self.max_wait:
+                check_count += 1
                 premium = self.context.wait_service.get_streamed_premium(self.order)
+                
+                # ✅ Enhanced logging for stream reliability testing
+                if check_count % 10 == 0:  # Log every 10 checks (every 0.5s)
+                    self.log(f"Stream check #{check_count} | waited={waited:.2f}s | premium={premium}")
+                
                 if premium and premium > 0:
-                    self.log(f"✅ Premium received from stream after {waited:.2f}s | premium={premium}")
+                    self.log(f"✅ Premium received from stream after {waited:.2f}s ({check_count} checks) | premium={premium}")
                     break
                 time.sleep(self.wait_interval)
                 waited += self.wait_interval
@@ -120,10 +173,31 @@ class PremiumFetchingState(OrderPipelineState):
                     self.log(f"Premium not available, retrying... (retry {self.retry_count + 1}/{self.max_retries})")
                     return PremiumFetchingState(self.order, self.context, self.retry_count + 1)
                 else:
-                    error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries"
-                    self.log(error_msg, "error")
-                    self.order.mark_failed(error_msg)
-                    return FailedState(self.order, self.context, error_msg)
+                    # ✅ FIX: At market open, try snapshot fallback if stream doesn't have NBBO
+                    if self._is_near_market_open():
+                        self.log("Stream has no NBBO at market open - trying snapshot fallback", "warning")
+                        try:
+                            snapshot = self.context.tws.get_option_snapshot(
+                                self.order.symbol, self.order.expiry, self.order.strike, self.order.right, timeout=5
+                            )
+                            if snapshot and snapshot.get("mid") and snapshot["mid"] > 0:
+                                premium = snapshot["mid"]
+                                self.log(f"✅ Premium from snapshot fallback: {premium} (market open)", "info")
+                            else:
+                                error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries, snapshot also failed"
+                                self.log(error_msg, "error")
+                                self.order.mark_failed(error_msg)
+                                return FailedState(self.order, self.context, error_msg)
+                        except Exception as e:
+                            error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries, snapshot fallback failed: {e}"
+                            self.log(error_msg, "error")
+                            self.order.mark_failed(error_msg)
+                            return FailedState(self.order, self.context, error_msg)
+                    else:
+                        error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries"
+                        self.log(error_msg, "error")
+                        self.order.mark_failed(error_msg)
+                        return FailedState(self.order, self.context, error_msg)
         
         # Store premium for next state
         self.context.premium = premium
@@ -137,7 +211,13 @@ class CalculatingState(OrderPipelineState):
     """Calculate entry_price, qty, SL/TP from premium"""
     
     def execute(self) -> Optional[OrderPipelineState]:
-        self.log("Calculating order parameters from premium")
+        import time
+        calc_start = time.time() * 1000
+        
+        self.log(
+            f"Calculating order parameters | premium={self.context.premium} | "
+            f"timestamp={calc_start:.0f}ms"
+        )
         
         premium = self.context.premium
         if not premium or premium <= 0:
@@ -154,9 +234,14 @@ class CalculatingState(OrderPipelineState):
         
         # Recalculate SL/TP based on actual premium (if they were placeholders)
         if self.order.sl_price == 0.5 or self.order.tp_price == 1.2:  # Placeholder values
+            old_sl = self.order.sl_price
+            old_tp = self.order.tp_price
             self.order.sl_price = round(premium * 0.8, 2)
             self.order.tp_price = round(premium * 1.2, 2)
-            self.log(f"Recalculated SL/TP: SL={self.order.sl_price} TP={self.order.tp_price} from premium={premium}")
+            self.log(
+                f"Recalculated SL/TP | premium={premium} | "
+                f"SL: {old_sl} → {self.order.sl_price} | TP: {old_tp} → {self.order.tp_price}"
+            )
         
         # Calculate entry_price from premium + arcTick
         mid = premium + arcTick
@@ -178,7 +263,7 @@ class CalculatingState(OrderPipelineState):
             if qty <= 0:
                 qty = 1
             self.order.qty = qty
-            self.log(f"Calculated qty={qty} from premium={premium}")
+            self.log(f"Calculated qty | position_size=${position_size} premium={premium} → qty={qty}")
         
         # Set SL/TP if not already set (fallback to model defaults)
         if not self.order.sl_price:
@@ -193,9 +278,11 @@ class CalculatingState(OrderPipelineState):
             else:
                 self.order.tp_price = round(entry_price * 1.2, 2)
         
+        calc_latency = time.time() * 1000 - calc_start
         self.log(
-            f"Order prepared | premium={premium} | entry_price={entry_price} | "
-            f"qty={self.order.qty} | SL={self.order.sl_price} | TP={self.order.tp_price}"
+            f"✅ Order calculated | premium={premium} entry_price={entry_price} | "
+            f"qty={self.order.qty} SL={self.order.sl_price} TP={self.order.tp_price} | "
+            f"latency={calc_latency:.1f}ms"
         )
         
         return PlacingState(self.order, self.context)
@@ -223,9 +310,10 @@ class PlacingState(OrderPipelineState):
         try:
             start_ts = time.time() * 1000
             logging.info(
-                f"[TWS-LATENCY] {self.order.symbol} Trigger hit → sending ENTRY order "
-                f"({self.order.right}{self.order.strike}) at {start_ts:.0f} ms | "
-                f"entry_price={self.order.entry_price} | qty={self.order.qty}"
+                f"[PLACE_ORDER] 🚀 Sending order to TWS | order_id={self.order.order_id} | "
+                f"symbol={self.order.symbol} {self.order.expiry} {self.order.strike}{self.order.right} | "
+                f"entry_price={self.order.entry_price} qty={self.order.qty} type={self.order.type} | "
+                f"timestamp={start_ts:.0f}ms"
             )
             
             success = self.context.tws.place_custom_order(self.order)
@@ -233,29 +321,43 @@ class PlacingState(OrderPipelineState):
             if success:
                 end_ts = time.time() * 1000
                 latency = end_ts - start_ts
+                ib_order_id = getattr(self.order, "_ib_order_id", "?")
+                
                 logging.info(
-                    f"[TWS-LATENCY] {self.order.symbol} Order sent in {latency:.1f} ms "
-                    f"(start {start_ts:.0f} → end {end_ts:.0f})"
+                    f"[PLACE_ORDER] ✅ Order sent successfully | order_id={self.order.order_id} | "
+                    f"IB_order_id={ib_order_id} | latency={latency:.1f}ms | "
+                    f"start={start_ts:.0f}ms end={end_ts:.0f}ms"
                 )
                 
-                self.order.mark_active(result=f"IB Order ID: {self.order._ib_order_id}")
+                self.order.mark_active(result=f"IB Order ID: {ib_order_id}")
                 
                 # Update UI callback
                 if getattr(self.order, "_status_callback", None):
                     try:
                         self.order._status_callback(f"Finalized: {self.order.symbol} {self.order.order_id}", "green")
+                        logging.debug(f"[PLACE_ORDER] UI callback executed | order_id={self.order.order_id}")
                     except Exception as e:
                         self.log(f"UI callback failed: {e}", "error")
                 
                 return WaitingForFillState(self.order, self.context)
             else:
                 error_msg = "Failed to place order with TWS"
+                total_latency = time.time() * 1000 - start_ts
+                logging.error(
+                    f"[PLACE_ORDER] ❌ FAILED | order_id={self.order.order_id} | "
+                    f"error={error_msg} | latency={total_latency:.1f}ms"
+                )
                 self.log(error_msg, "error")
                 self.order.mark_failed(error_msg)
                 return FailedState(self.order, self.context, error_msg)
                 
         except Exception as e:
             error_msg = f"Exception during order placement: {e}"
+            total_latency = time.time() * 1000 - start_ts
+            logging.exception(
+                f"[PLACE_ORDER] ❌ EXCEPTION | order_id={self.order.order_id} | "
+                f"error={error_msg} | latency={total_latency:.1f}ms"
+            )
             self.log(error_msg, "error")
             self.order.mark_failed(error_msg)
             return FailedState(self.order, self.context, error_msg)
@@ -272,17 +374,35 @@ class WaitingForFillState(OrderPipelineState):
         self.timeout = timeout
     
     def execute(self) -> Optional[OrderPipelineState]:
-        self.log(f"Waiting for order fill (timeout={self.timeout}s)")
+        import time
+        wait_start = time.time() * 1000
+        
+        self.log(
+            f"Waiting for order fill | order_id={self.order_id} | "
+            f"IB_order_id={getattr(self.order, '_ib_order_id', '?')} | "
+            f"timeout={self.timeout}s | timestamp={wait_start:.0f}ms"
+        )
         
         if not hasattr(self.order, "_fill_event") or not self.order._fill_event:
             self.log("No fill event available, marking as finalized", "warning")
             return FinalizedState(self.order, self.context)
         
         filled = self.order._fill_event.wait(timeout=self.timeout)
+        wait_latency = time.time() * 1000 - wait_start
         
         if filled and self.order.state == OrderState.FINALIZED:
             order_manager.add_finalized_order(self.order_id, self.order)
-            self.log(f"Order filled and finalized → IB ID: {self.order._ib_order_id}")
+            ib_order_id = getattr(self.order, "_ib_order_id", "?")
+            
+            logging.info(
+                f"[FILL] ✅ Order filled and finalized | order_id={self.order_id} | "
+                f"IB_order_id={ib_order_id} | wait_time={wait_latency:.1f}ms"
+            )
+            
+            self.log(
+                f"Order filled and finalized → IB ID: {ib_order_id} | "
+                f"wait_time={wait_latency:.1f}ms"
+            )
             
             # Update watcher info
             watcher_info.update_watcher(self.order_id, STATUS_FINALIZED)
@@ -292,6 +412,10 @@ class WaitingForFillState(OrderPipelineState):
             return FinalizedState(self.order, self.context)
         else:
             error_msg = f"Order not filled within {self.timeout}s timeout"
+            logging.warning(
+                f"[FILL] ⚠️ Timeout | order_id={self.order_id} | "
+                f"timeout={self.timeout}s wait_time={wait_latency:.1f}ms"
+            )
             self.log(error_msg, "warning")
             # Even if not filled, we mark the watcher as finalized if the order was sent
             if self.context.tinfo:
@@ -306,20 +430,40 @@ class FinalizedState(OrderPipelineState):
     """Order is finalized - start stop-loss watcher if needed"""
     
     def execute(self) -> Optional[OrderPipelineState]:
-        self.log("Order finalized")
+        import time
+        finalize_ts = time.time() * 1000
+        
+        self.log(
+            f"Order finalized | order_id={self.order_id} | "
+            f"IB_order_id={getattr(self.order, '_ib_order_id', '?')} | "
+            f"state={self.order.state} | timestamp={finalize_ts:.0f}ms"
+        )
         
         # Start stop-loss watcher if configured
         if self.order.trigger or (self.order.sl_price and self.order.state == OrderState.FINALIZED):
+            logging.info(
+                f"[FINALIZE] Starting stop-loss watcher | order_id={self.order_id} | "
+                f"SL={self.order.sl_price} trigger={self.order.trigger}"
+            )
             self._start_stop_loss_watcher()
         
         return None  # Terminal state
     
     def _start_stop_loss_watcher(self):
         """Start monitoring stop-loss level"""
+        import time
+        watcher_start = time.time() * 1000
+        
         stop_loss_level = (
             self.order.trigger - self.order.sl_price 
             if self.order.right in ['C', 'CALL'] 
             else self.order.trigger + self.order.sl_price
+        )
+        
+        logging.info(
+            f"[STOP_LOSS] Calculating stop-loss level | order_id={self.order_id} | "
+            f"trigger={self.order.trigger} SL={self.order.sl_price} right={self.order.right} | "
+            f"stop_loss_level={stop_loss_level}"
         )
         
         exit_order = Order(
@@ -340,7 +484,16 @@ class FinalizedState(OrderPipelineState):
         exit_order.previous_id = self.order.order_id
         exit_order.mark_active()
         
-        self.log(f"Spawned EXIT watcher {exit_order.order_id} | stop={stop_loss_level} ({self.order.right})")
+        watcher_latency = time.time() * 1000 - watcher_start
+        logging.info(
+            f"[STOP_LOSS] ✅ Watcher created | exit_order_id={exit_order.order_id} | "
+            f"base_order_id={self.order.order_id} | stop_loss_level={stop_loss_level} | "
+            f"right={self.order.right} qty={exit_order.qty} | latency={watcher_latency:.1f}ms"
+        )
+        
+        self.log(
+            f"Spawned EXIT watcher {exit_order.order_id} | stop={stop_loss_level} ({self.order.right})"
+        )
         
         self.context.wait_service.start_stop_loss_watcher(exit_order, stop_loss_level, mode="poll")
     

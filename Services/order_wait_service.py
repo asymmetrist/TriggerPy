@@ -135,8 +135,12 @@ class OrderWaitService:
                     tinfo.update_status(STATUS_RUNNING, last_price=last_price)
 
                 if last_price and order.is_triggered(last_price):
+                    import time
+                    trigger_ts = time.time() * 1000
                     logging.info(
-                        f"[WaitService] 🎯 TRIGGER MET | order_id={order_id} | price={last_price} | trigger={order.trigger}"
+                        f"[TRIGGER_POLL] 🚨 TRIGGERED! | order_id={order_id} | "
+                        f"symbol={order.symbol} | price={last_price} trigger={order.trigger} | "
+                        f"timestamp={trigger_ts:.0f}ms"
                     )
 
                     # Check if premarket - if so, prompt rebase/cancel instead of firing
@@ -445,24 +449,47 @@ class OrderWaitService:
         mode="ws"   -> subscribe to live ticks (original behavior)
         mode="poll" -> start a polling thread using snapshot
         """
+        import time
+        add_start = time.time() * 1000
+        
         order_id = order.order_id
+        logging.info(
+            f"[ADD_ORDER] Starting | order_id={order_id} | symbol={order.symbol} | "
+            f"{order.expiry} {order.strike}{order.right} | trigger={order.trigger} | "
+            f"mode={mode} | timestamp={add_start:.0f}ms"
+        )
+        
         with self.lock:
             self.pending_orders[order_id] = order
+        logging.debug(f"[ADD_ORDER] Order added to pending_orders dict | order_id={order_id}")
 
         # ✅ START PREMIUM STREAM FIRST (before checking trigger)
         if order.trigger:  # Only stream if order has trigger
+            stream_start = time.time() * 1000
+            logging.info(
+                f"[ADD_ORDER] Starting premium stream | order_id={order_id} | "
+                f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+                f"timestamp={stream_start:.0f}ms"
+            )
             self._start_premium_stream(order)
+            stream_latency = time.time() * 1000 - stream_start
+            logging.info(
+                f"[ADD_ORDER] ✅ Premium stream started | order_id={order_id} | "
+                f"latency={stream_latency:.1f}ms"
+            )
             # Give stream a moment to start receiving ticks (100ms)
             time.sleep(0.1)
 
         # ✅ IMMEDIATE TRIGGER CHECK (after stream started)
+        logging.debug(f"[ADD_ORDER] Checking if trigger already met | order_id={order_id}")
         current_price = self.polygon.get_last_trade(order.symbol)
+        
         if current_price and order.is_triggered(current_price):
             # ✅ Check if premarket - if so, show rebase popup instead of finalizing
             if is_market_closed_or_pre_market():
                 logging.info(
-                    f"[WaitService] 🚨 TRIGGER MET IN PREMARKET! Showing rebase popup. "
-                    f"Current: {current_price}, Trigger: {order.trigger}"
+                    f"[ADD_ORDER] 🚨 TRIGGER MET IN PREMARKET | order_id={order_id} | "
+                    f"current={current_price} trigger={order.trigger} | showing rebase popup"
                 )
                 # Create a dummy ThreadInfo for the popup
                 tinfo = ThreadInfo(order_id, order.symbol, watcher_type="trigger", mode="poll")
@@ -471,21 +498,27 @@ class OrderWaitService:
                 # Don't return - continue to start watcher so it can trigger again after rebase
             else:
                 # RTH - fire immediately
+                total_latency = time.time() * 1000 - add_start
                 logging.info(
-                    f"[WaitService] 🚨 TRIGGER ALREADY MET! Executing immediately. "
-                    f"Current: {current_price}, Trigger: {order.trigger}"
+                    f"[ADD_ORDER] 🚨 TRIGGER ALREADY MET (RTH) | order_id={order_id} | "
+                    f"current={current_price} trigger={order.trigger} | executing immediately | "
+                    f"total_latency={total_latency:.1f}ms"
                 )
                 self._finalize_order(order_id, order, tinfo=None, last_price=current_price)
                 return order_id
 
         # Subscribe / start poller only if trigger not already met
+        logging.info(f"[ADD_ORDER] Starting trigger watcher | order_id={order_id} | mode={mode}")
+        watcher_start = time.time() * 1000
         self.start_trigger_watcher(order, mode) # 💡 Simplified to use the router
+        watcher_latency = time.time() * 1000 - watcher_start
         
-        msg = (
-            f"[WaitService] Order added {order_id} "
-            f"(mode={mode}, waiting for trigger {order.trigger}, current: {current_price})"
+        total_latency = time.time() * 1000 - add_start
+        logging.info(
+            f"[ADD_ORDER] ✅ Order added and watching | order_id={order_id} | "
+            f"mode={mode} trigger={order.trigger} current={current_price} | "
+            f"watcher_latency={watcher_latency:.1f}ms total={total_latency:.1f}ms"
         )
-        logging.info(msg)
         return order_id
 
     def cancel_order(self, order_id: str):
@@ -535,31 +568,63 @@ class OrderWaitService:
 
     def _start_premium_stream(self, order: Order):
         """Start streaming bid/ask ticks for option premium (real-time cache)"""
+        import time
+        stream_start = time.time() * 1000
+        
         key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
+        logging.info(
+            f"[PREMIUM_STREAM] Starting | order_id={order.order_id} | "
+            f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+            f"key={key} | timestamp={stream_start:.0f}ms"
+        )
         
         with self._stream_lock:
             # Check if stream already exists
             if key in self._premium_streams:
                 # Stream exists - just add this order to reference count
                 self._premium_streams[key]["order_ids"].add(order.order_id)
-                logging.debug(f"[WaitService] Reusing existing premium stream for {order.symbol} {order.expiry} {order.strike}{order.right}")
+                existing_req_id = self._premium_streams[key].get("req_id")
+                latency = time.time() * 1000 - stream_start
+                logging.info(
+                    f"[PREMIUM_STREAM] ✅ Reusing existing stream | order_id={order.order_id} | "
+                    f"req_id={existing_req_id} | latency={latency:.1f}ms (reused)"
+                )
                 return
             
             # Need to start new stream
             # Get conId (use cached if available)
+            conid_start = time.time() * 1000
             conid = self.tws._pre_conid_cache.get(key)
-            if not conid:
+            if conid:
+                conid_latency = time.time() * 1000 - conid_start
+                logging.info(
+                    f"[PREMIUM_STREAM] ConID from cache | order_id={order.order_id} | "
+                    f"conID={conid} | latency={conid_latency:.1f}ms"
+                )
+            else:
                 # Resolve conId
+                logging.info(f"[PREMIUM_STREAM] Resolving conID (cache miss) | order_id={order.order_id}")
                 from ibapi.contract import Contract
                 contract = self.tws.create_option_contract(
                     order.symbol, order.expiry, order.strike, order.right
                 )
                 conid = self.tws.resolve_conid(contract, timeout=5)
+                conid_latency = time.time() * 1000 - conid_start
+                
                 if not conid:
-                    logging.warning(f"[WaitService] Cannot start premium stream - no conId for {order.symbol} {order.expiry} {order.strike}{order.right}")
+                    total_latency = time.time() * 1000 - stream_start
+                    logging.error(
+                        f"[PREMIUM_STREAM] ❌ ConID resolution failed | order_id={order.order_id} | "
+                        f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+                        f"conid_latency={conid_latency:.1f}ms total={total_latency:.1f}ms"
+                    )
                     return
                 # Cache it
                 self.tws._pre_conid_cache[key] = conid
+                logging.info(
+                    f"[PREMIUM_STREAM] ✅ ConID resolved | order_id={order.order_id} | "
+                    f"conID={conid} | latency={conid_latency:.1f}ms"
+                )
             
             # Create contract with conId
             from ibapi.contract import Contract
@@ -589,13 +654,24 @@ class OrderWaitService:
             
             # Request streaming market data (snapshot=False means continuous)
             try:
+                req_start = time.time() * 1000
                 self.tws.reqMktData(req_id, contract, "", False, False, [])
+                req_latency = time.time() * 1000 - req_start
+                total_latency = time.time() * 1000 - stream_start
+                
                 logging.info(
-                    f"[WaitService] ✅ Started premium stream for {order.symbol} {order.expiry} {order.strike}{order.right} "
-                    f"(req_id={req_id}, conId={conid})"
+                    f"[PREMIUM_STREAM] ✅ Stream started | order_id={order.order_id} | "
+                    f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+                    f"req_id={req_id} conID={conid} | "
+                    f"req_latency={req_latency:.1f}ms total={total_latency:.1f}ms | "
+                    f"timestamp={time.time()*1000:.0f}ms"
                 )
             except Exception as e:
-                logging.error(f"[WaitService] Failed to start premium stream: {e}")
+                total_latency = time.time() * 1000 - stream_start
+                logging.error(
+                    f"[PREMIUM_STREAM] ❌ Failed to start | order_id={order.order_id} | "
+                    f"error={e} | total_latency={total_latency:.1f}ms"
+                )
                 # Cleanup on error
                 del self._premium_streams[key]
                 del self._premium_streams_by_req_id[req_id]
@@ -635,62 +711,57 @@ class OrderWaitService:
         with self._stream_lock:
             stream = self._premium_streams.get(key)
             if not stream:
+                logging.debug(f"[WaitService] Stream not found for {order.symbol} {order.expiry} {order.strike}{order.right}")
                 return None  # Stream doesn't exist
             
-            # Wait up to 200ms for stream to populate (for immediate trigger case)
-            max_wait = 0.2
-            wait_interval = 0.01
-            waited = 0
-            while waited < max_wait:
-                bid = stream.get("bid")
-                ask = stream.get("ask")
-                mid = stream.get("mid")
-                
-                # If we have mid, use it
-                if mid and mid > 0:
-                    logging.info(
-                        f"[WaitService] ✅ Premium from stream: {mid} (0ms latency) | "
-                        f"bid={bid} ask={ask}"
-                    )
-                    return mid
-                
-                # If we have bid and ask but no mid, calculate it
-                if bid and ask and bid > 0 and ask > 0:
-                    calculated_mid = (bid + ask) / 2
-                    stream["mid"] = calculated_mid
-                    stream["last_update"] = time.time()
-                    logging.info(
-                        f"[WaitService] ✅ Premium calculated from stream bid/ask: {calculated_mid} (0ms latency) | "
-                        f"bid={bid} ask={ask}"
-                    )
-                    return calculated_mid
-                
-                time.sleep(wait_interval)
-                waited += wait_interval
-            
-            # Check if stream is fresh (updated in last 5 seconds)
+            # ✅ Enhanced logging for stream reliability testing
+            req_id = stream.get("req_id")
             last_update = stream.get("last_update", 0)
-            if last_update < time.time() - 5:
-                logging.warning(f"[WaitService] Premium stream stale for {order.symbol} {order.expiry} {order.strike}{order.right} (last_update={last_update}, age={time.time() - last_update:.1f}s)")
-                return None
+            age = time.time() - last_update if last_update > 0 else float('inf')
             
-            # Final check - try to get mid or calculate from bid/ask
             bid = stream.get("bid")
             ask = stream.get("ask")
             mid = stream.get("mid")
             
+            # Log stream state for debugging
+            logging.debug(
+                f"[WaitService] Stream state | req_id={req_id} | "
+                f"bid={bid} ask={ask} mid={mid} | "
+                f"age={age:.2f}s | last_update={last_update}"
+            )
+            
+            # If we have mid, use it
             if mid and mid > 0:
-                logging.info(f"[WaitService] ✅ Premium from stream: {mid} (0ms latency)")
+                logging.info(
+                    f"[WaitService] ✅ Premium from stream: {mid} (0ms latency) | "
+                    f"bid={bid} ask={ask} | age={age:.2f}s"
+                )
                 return mid
             
+            # If we have bid and ask but no mid, calculate it
             if bid and ask and bid > 0 and ask > 0:
                 calculated_mid = (bid + ask) / 2
                 stream["mid"] = calculated_mid
                 stream["last_update"] = time.time()
-                logging.info(f"[WaitService] ✅ Premium calculated from stream bid/ask: {calculated_mid} | bid={bid} ask={ask}")
+                logging.info(
+                    f"[WaitService] ✅ Premium calculated from stream bid/ask: {calculated_mid} (0ms latency) | "
+                    f"bid={bid} ask={ask} | age={age:.2f}s"
+                )
                 return calculated_mid
             
-            logging.debug(f"[WaitService] Stream exists but no valid price data yet for {order.symbol} | bid={bid} ask={ask} mid={mid}")
+            # Check if stream is stale (updated more than 5 seconds ago)
+            if last_update > 0 and age > 5:
+                logging.warning(
+                    f"[WaitService] ⚠️ Premium stream stale for {order.symbol} {order.expiry} {order.strike}{order.right} | "
+                    f"age={age:.1f}s | bid={bid} ask={ask} mid={mid}"
+                )
+                return None
+            
+            # Stream exists but no data yet
+            logging.debug(
+                f"[WaitService] Stream exists but no valid price data yet for {order.symbol} | "
+                f"bid={bid} ask={ask} mid={mid} | age={age:.2f}s"
+            )
         
         return None
 
@@ -700,9 +771,13 @@ class OrderWaitService:
 
     def _on_tick(self, order_id: str, price: float):
         """Callback from PolygonService for live ENTRY triggers."""
+        import time
+        tick_ts = time.time() * 1000
+        
         with self.lock:
             order = self.pending_orders.get(order_id)
             if not order or order_id in self.cancelled_orders:
+                logging.debug(f"[TRIGGER_WS] Tick ignored | order_id={order_id} | price={price} | order not found or cancelled")
                 return # Order was finalized or cancelled
 
         # Update watcher info with live price
@@ -712,12 +787,17 @@ class OrderWaitService:
         with self.trigger_lock:
             if order.is_triggered(price) and  order not in self.trigger_status:
                 self.trigger_status.add(order)
-                logging.info(f"[WaitService-WS] TRIGGERED! {order.symbol} @ {price}, trigger={order.trigger}")
+                logging.info(
+                    f"[TRIGGER_WS] 🚨 TRIGGERED! | order_id={order_id} | "
+                    f"symbol={order.symbol} | price={price} trigger={order.trigger} | "
+                    f"timestamp={tick_ts:.0f}ms"
+                )
                 
                 # Check if premarket - if so, prompt rebase/cancel instead of firing
                 if is_market_closed_or_pre_market():
                     logging.info(
-                        f"[WaitService-WS] Premarket trigger hit - prompting rebase/cancel | order_id={order_id}"
+                        f"[TRIGGER_WS] Premarket trigger hit | order_id={order_id} | "
+                        f"prompting rebase/cancel | price={price} trigger={order.trigger}"
                     )
                     self._handle_premarket_trigger(order_id, order, tinfo, price)
                     # Continue watching (don't remove from pending_orders)
@@ -726,6 +806,10 @@ class OrderWaitService:
                     return
                 else:
                     # RTH - fire the order
+                    logging.info(
+                        f"[TRIGGER_WS] RTH trigger hit - finalizing order | order_id={order_id} | "
+                        f"price={price} trigger={order.trigger} | timestamp={tick_ts:.0f}ms"
+                    )
                     self._finalize_order(order_id, order, tinfo=None, last_price=price)
                     
                     # --- Unsubscribe and cleanup ---
@@ -1151,25 +1235,37 @@ class OrderWaitService:
         - Fill waiting
         - Stop-loss watcher setup
         """
+        import time
+        finalize_start = time.time() * 1000
+        
         logging.info(
-            f"[WaitService] _finalize_order called | order_id={order_id} | "
-            f"entry_price={getattr(order, 'entry_price', None)} | "
-            f"_order_ready={getattr(order, '_order_ready', None)}"
+            f"[FINALIZE] Starting order finalization | order_id={order_id} | "
+            f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+            f"trigger_price={last_price} | entry_price={getattr(order, 'entry_price', None)} | "
+            f"_order_ready={getattr(order, '_order_ready', None)} | timestamp={finalize_start:.0f}ms"
         )
         
         # ✅ Use State Pattern pipeline
         pipeline = OrderPipeline(order, self, self.tws, tinfo)
+        pipeline_start = time.time() * 1000
         success = pipeline.execute()
+        pipeline_latency = time.time() * 1000 - pipeline_start
+        total_latency = time.time() * 1000 - finalize_start
         
         if not success:
             # Pipeline failed - update watcher info
             watcher_info.update_watcher(order_id, STATUS_FAILED)
             if tinfo:
                 tinfo.update_status(STATUS_FAILED, last_price=last_price)
-        
-        logging.info(
-            f"[WaitService] _finalize_order completed | order_id={order_id} | success={success}"
-        )
+            logging.error(
+                f"[FINALIZE] ❌ FAILED | order_id={order_id} | "
+                f"pipeline_latency={pipeline_latency:.1f}ms total={total_latency:.1f}ms"
+            )
+        else:
+            logging.info(
+                f"[FINALIZE] ✅ SUCCESS | order_id={order_id} | "
+                f"pipeline_latency={pipeline_latency:.1f}ms total={total_latency:.1f}ms"
+            )
 
     def get_order_status(self, order_id: str):
         return self.tws.get_order_status(order_id)
