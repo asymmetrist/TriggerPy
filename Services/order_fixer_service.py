@@ -174,15 +174,10 @@ class OrderFixerService:
                 pass
 
         # ----------------------------
-        # 4. ConId resolution (cached)
+        # 4. ConId resolution (skipped - already resolved in prepare_option_order())
         # ----------------------------
-        if not getattr(order, "_pre_conid", None):
-            try:
-                ok = self.tws.pre_conid(order)
-                if ok:
-                    changed = True
-            except Exception:
-                pass
+        # ConID is already resolved during order preparation (model.py:prepare_option_order)
+        # No need to resolve again here - just verify it exists in readiness check
 
         # ----------------------------
         # 5. Final readiness check

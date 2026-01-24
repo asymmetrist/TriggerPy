@@ -101,6 +101,7 @@ class ArcTriggerApp(tk.Tk):
         # Replay mode toggle
         self.replay_mode = False
         self.replay_service = None
+        self.replay_info = {}  # Store replay config (symbol, date, start_time, end_time, speed)
         ttk.Button(top_frame, text="🎬 Replay", command=self.toggle_replay_mode).pack(side="left", padx=5)
         self.replay_status_label = ttk.Label(top_frame, text="", foreground="gray", background="black")
         self.replay_status_label.pack(side="left", padx=5)
@@ -582,6 +583,15 @@ class ArcTriggerApp(tk.Tk):
             set_replay_service(self.replay_service)  # Register globally for price lookups
             self.replay_mode = True
             
+            # Store replay info for UI updates
+            self.replay_info = {
+                "symbol": symbol,
+                "date": date,
+                "start_time": start_time_str,
+                "end_time": end_time_str,
+                "speed": speed
+            }
+            
             # Start replay in background thread
             def start_replay():
                 try:
@@ -593,6 +603,8 @@ class ArcTriggerApp(tk.Tk):
                         speed=speed,
                         order_mode="real"  # Use real TWS (paper account)
                     )
+                    # Start UI update loop after replay starts
+                    self.after(500, self._update_replay_status_ui)  # Wait 500ms for replay to initialize
                 except Exception as e:
                     logging.error(f"[UI] Replay start error: {e}", exc_info=True)
                     self.after(0, lambda: messagebox.showerror("Replay Error", f"Failed to start replay:\n{e}"))
@@ -600,11 +612,8 @@ class ArcTriggerApp(tk.Tk):
             
             threading.Thread(target=start_replay, daemon=True, name="ReplayThread").start()
             
-            # Update UI
-            self.replay_status_label.config(
-                text=f"🎬 {symbol} {date} {start_time_str}-{end_time_str} ({speed}x)",
-                foreground="green"
-            )
+            # Initial UI update
+            self._update_replay_status_ui()
             logging.info(f"[UI] Replay mode started: {symbol} on {date} from {start_time_str} to {end_time_str} at {speed}x speed")
             
         except Exception as e:
@@ -626,9 +635,60 @@ class ArcTriggerApp(tk.Tk):
         set_replay_service(None)
         
         self.replay_mode = False
+        self.replay_info = {}
         self.replay_status_label.config(text="", foreground="gray")
         logging.info("[UI] Replay mode stopped")
 
+    def _update_replay_status_ui(self):
+        """
+        Update replay status label with current replay time.
+        Called periodically when replay is active.
+        """
+        if not self.replay_mode or not self.replay_service:
+            return
+        
+        try:
+            status = self.replay_service.get_replay_status()
+            if status.get("is_replaying"):
+                current_time = status.get("current_time")
+                is_paused = status.get("is_paused", False)
+                speed = status.get("speed", 1.0)
+                
+                # Format current time
+                if current_time:
+                    from datetime import datetime
+                    if isinstance(current_time, datetime):
+                        time_str = current_time.strftime("%H:%M:%S")
+                    else:
+                        time_str = str(current_time)
+                else:
+                    time_str = "Initializing..."
+                
+                # Build status text
+                info = self.replay_info
+                if info:
+                    pause_indicator = " ⏸️" if is_paused else ""
+                    status_text = (
+                        f"🎬 {info.get('symbol', '?')} {info.get('date', '?')} | "
+                        f"Time: {time_str} | {speed}x{pause_indicator}"
+                    )
+                else:
+                    status_text = f"🎬 Replaying | Time: {time_str} | {speed}x"
+                
+                self.replay_status_label.config(
+                    text=status_text,
+                    foreground="orange" if is_paused else "green"
+                )
+                
+                # Schedule next update (every 500ms)
+                self.after(500, self._update_replay_status_ui)
+            else:
+                # Replay stopped, clear label
+                self.replay_status_label.config(text="", foreground="gray")
+        except Exception as e:
+            logging.debug(f"[UI] Replay status update error: {e}")
+            # Retry after delay
+            self.after(1000, self._update_replay_status_ui)
 
     # ------------------------------------------------------------------
     #  CONNECTIONS

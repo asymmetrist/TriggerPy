@@ -48,6 +48,33 @@ class OrderWaitService:
         with self._arclock:
             self._stoplosses[order.order_id] =stop_loss_price
 
+    def _is_replay_mode(self) -> bool:
+        """
+        Detect if replay mode is currently active.
+        Returns True if replay service is running, False otherwise.
+        """
+        try:
+            from Replay.replay_service import _replay_service_instance
+            return (
+                _replay_service_instance is not None 
+                and _replay_service_instance.is_replaying
+            )
+        except (ImportError, AttributeError):
+            return False
+
+    def _get_current_time_ms(self) -> float:
+        """
+        Get current time in milliseconds - replay-aware.
+        Works seamlessly in both real-time and replay modes.
+        
+        In replay mode: Uses mocked time.time() from ReplayTimeContext
+        In real-time: Uses actual time.time()
+        """
+        # time.time() is already imported at module level (line 2)
+        # In replay mode, it's automatically mocked by ReplayTimeContext
+        # So we can just use it directly - no need to re-import
+        return time.time() * 1000
+
     def _poll_snapshot_thread(self, order_id: str, order: Order, tinfo: ThreadInfo):
         """
         Inner polling thread logic for trigger watcher (formerly _poll_snapshot).
@@ -134,8 +161,13 @@ class OrderWaitService:
                     tinfo.update_status(STATUS_RUNNING, last_price=last_price)
 
                 if last_price and order.is_triggered(last_price):
+                    # ✅ Replay-aware: Use helper method that works in both modes
+                    trigger_ts = self._get_current_time_ms()
+                    replay_status = "REPLAY" if self._is_replay_mode() else "REALTIME"
                     logging.info(
-                        f"[WaitService] 🎯 TRIGGER MET | order_id={order_id} | price={last_price} | trigger={order.trigger}"
+                        f"[TRIGGER_POLL] 🚨 TRIGGERED! | order_id={order_id} | "
+                        f"symbol={order.symbol} | price={last_price} trigger={order.trigger} | "
+                        f"timestamp={trigger_ts:.0f}ms | mode={replay_status}"
                     )
 
                     # Check if premarket - if so, prompt rebase/cancel instead of firing
