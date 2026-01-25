@@ -101,9 +101,25 @@ def is_market_closed_or_pre_market(now: datetime = None) -> bool:
     """
     Check if NASDAQ is currently closed or in pre-market (before 9:30 AM ET).
     This includes weekends and after-hours (after 4:00 PM ET).
+    Replay-aware: Uses simulated time when in replay mode.
     """
     if now is None:
-        now = datetime.now(EASTERN)
+        # ✅ Replay-aware: Get time from replay service if active
+        try:
+            from Replay.replay_service import _replay_service_instance
+            if (
+                _replay_service_instance is not None
+                and _replay_service_instance.is_replaying
+                and _replay_service_instance.time_context
+            ):
+                # Use simulated time from replay (real datetime object, not MagicMock)
+                now = _replay_service_instance.time_context.get_simulated_time()
+            else:
+                # Normal real-time mode - use actual system time
+                now = datetime.now(EASTERN)
+        except (ImportError, AttributeError):
+            # Fallback to normal mode if replay not available
+            now = datetime.now(EASTERN)
     else:
         now = now.astimezone(EASTERN)
 
