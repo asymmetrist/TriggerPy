@@ -695,8 +695,12 @@ class AppModel:
         # ✅ Store model and args for pipeline to use
         order._model = self
         order._args = {
+            "action": action,
             "arcTick": arcTick,
-            "position": position
+            "position": position,
+            "quantity": quantity,
+            "trigger_price": trigger_price,
+            "status_callback": status_callback
         }
 
         cb = status_callback or self._status_callback
@@ -791,7 +795,38 @@ class AppModel:
 
 
     def get_available_strikes(self, expiry: str) -> List[float]:
+        """
+        Get available strikes for an expiry.
+        Hybrid approach: Use cached strikes if available, then fetch from TWS for complete list.
+        """
         try:
+            # ✅ Step 1: Try to get cached strikes first (fast, 0ms)
+            from Services.persistent_conid_storage import storage
+            cached_data = storage.get_cached_option_conids(self._symbol, expiry)
+            if cached_data:
+                cached_strikes = sorted(set([float(row["strike"]) for row in cached_data]))
+                logging.info(f"AppModel[{self._symbol}]: Found {len(cached_strikes)} cached strikes for {expiry}")
+                
+                # ✅ Step 2: Still fetch from TWS in background for complete/updated list
+                def fetch_fresh():
+                    try:
+                        maturities = general_app.tws.get_maturities(self._symbol)
+                        if maturities and expiry in maturities.get("expirations", []):
+                            fresh_strikes = maturities.get("strikes", [])
+                            # Merge cached + fresh (dedupe and sort)
+                            all_strikes = sorted(set(cached_strikes + fresh_strikes))
+                            logging.info(f"AppModel[{self._symbol}]: Merged {len(cached_strikes)} cached + {len(fresh_strikes)} fresh = {len(all_strikes)} total strikes")
+                            return all_strikes
+                    except Exception as e:
+                        logging.warning(f"AppModel[{self._symbol}]: Failed to fetch fresh strikes, using cached: {e}")
+                        return cached_strikes
+                
+                # Return cached immediately, fetch fresh in background
+                import threading
+                threading.Thread(target=fetch_fresh, daemon=True).start()
+                return cached_strikes
+            
+            # ✅ Step 3: No cache - fetch from TWS (normal flow)
             maturities = general_app.tws.get_maturities(self._symbol)
             return (
                 maturities["strikes"]

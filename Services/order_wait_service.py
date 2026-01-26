@@ -63,19 +63,38 @@ class OrderWaitService:
                 logging.debug(f"[WaitService] Loop tick | order_id={order_id} | state={order.state}")
                 
                 # Order preparation check - should ideally be done before watcher starts
+                # ✅ FIX: Skip legacy preparation if model is None (pipeline handles it in _finalize_order)
                 if not order._order_ready:
                     logging.warning(f"[WaitService] Order not ready, preparing | order_id={order_id}")
                     model = order._model
                     _args = order._args
-                    _order = model.prepare_option_order(action= _args["action"]
-                                                        ,position=_args["position"]
-                                                        ,quantity=_args["quantity"]
-                                                        ,trigger_price=_args["trigger_price"]
-                                                        ,arcTick=_args["arcTick"]
-                                                        ,type="LMT"
-                                                        ,status_callback=_args["status_callback"])
-                    order = _order
-                    logging.info(f"[WaitService] Order prepared in watcher | order_id={order_id}")
+                    
+                    # ✅ Check if model exists before using it
+                    if model is None:
+                        logging.warning(f"[WaitService] Order model is None - skipping preparation (pipeline will handle) | order_id={order_id}")
+                        # Pipeline will handle premium fetching at trigger time
+                        # Just mark as ready to proceed with monitoring
+                        order._order_ready = True
+                    elif _args and "action" in _args:
+                        try:
+                            _order = model.prepare_option_order(
+                                action=_args["action"],
+                                position=_args["position"],
+                                quantity=_args["quantity"],
+                                trigger_price=_args["trigger_price"],
+                                arcTick=_args["arcTick"],
+                                type="LMT",
+                                status_callback=_args["status_callback"]
+                            )
+                            order = _order
+                            logging.info(f"[WaitService] Order prepared in watcher | order_id={order_id}")
+                        except Exception as e:
+                            logging.error(f"[WaitService] Failed to prepare order in watcher | order_id={order_id} | error={e}")
+                            # Continue anyway - pipeline will handle it
+                            order._order_ready = True
+                    else:
+                        logging.warning(f"[WaitService] Order args missing - skipping preparation | order_id={order_id}")
+                        order._order_ready = True
 
                 # Consolidated lock check
                 with self.lock:
@@ -438,12 +457,25 @@ class OrderWaitService:
         # ✅ IMMEDIATE TRIGGER CHECK (after stream started)
         current_price = self.polygon.get_last_trade(order.symbol)
         if current_price and order.is_triggered(current_price):
-            logging.info(
-                f"[WaitService] 🚨 TRIGGER ALREADY MET! Executing immediately. "
-                f"Current: {current_price}, Trigger: {order.trigger}"
-            )
-            self._finalize_order(order_id, order, tinfo=None, last_price=current_price)
-            return order_id
+            # ✅ Check if premarket - if so, show rebase popup instead of finalizing
+            if is_market_closed_or_pre_market():
+                logging.info(
+                    f"[WaitService] 🚨 TRIGGER MET IN PREMARKET! Showing rebase popup. "
+                    f"Current: {current_price}, Trigger: {order.trigger}"
+                )
+                # Create a dummy ThreadInfo for the popup
+                tinfo = ThreadInfo(order_id, order.symbol, watcher_type="trigger", mode="poll")
+                watcher_info.add_watcher(tinfo)
+                self._handle_premarket_trigger(order_id, order, tinfo, current_price)
+                # Don't return - continue to start watcher so it can trigger again after rebase
+            else:
+                # RTH - fire immediately
+                logging.info(
+                    f"[WaitService] 🚨 TRIGGER ALREADY MET! Executing immediately. "
+                    f"Current: {current_price}, Trigger: {order.trigger}"
+                )
+                self._finalize_order(order_id, order, tinfo=None, last_price=current_price)
+                return order_id
 
         # Subscribe / start poller only if trigger not already met
         self.start_trigger_watcher(order, mode) # 💡 Simplified to use the router
@@ -595,8 +627,8 @@ class OrderWaitService:
                 del self._premium_streams[key]
                 del self._premium_streams_by_req_id[req_id]
     
-    def _get_streamed_premium(self, order: Order) -> Optional[float]:
-        """Get premium from active stream (0ms latency) - returns None if stream not available"""
+    def get_streamed_premium(self, order: Order) -> Optional[float]:
+        """Get premium from active stream (0ms latency) - returns None if stream not available (PUBLIC API)"""
         key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
         
         with self._stream_lock:
@@ -1135,47 +1167,28 @@ class OrderWaitService:
             
             # If no premium, try stream first
             if not premium or premium <= 0:
-                premium = self._get_streamed_premium(order)
+                premium = self.get_streamed_premium(order)
             
-            # If still no premium, fetch with retry
+            # If still no premium, wait for stream (no snapshot fallback)
             if not premium or premium <= 0:
-                logging.info(f"[WaitService] Premium not available, fetching with retry | order_id={order_id}")
-                max_attempts = 4
-                retry_delay = 0.5
+                logging.info(f"[WaitService] Premium not available from stream, waiting... | order_id={order_id}")
+                max_wait = 1.0  # Wait up to 1 second for stream
+                wait_interval = 0.05
+                waited = 0
                 
-                from model import general_app
-                for attempt in range(1, max_attempts + 1):
-                    try:
+                while waited < max_wait:
+                    premium = self.get_streamed_premium(order)
+                    if premium and premium > 0:
                         logging.info(
-                            f"[WaitService] Premium fetch attempt {attempt}/{max_attempts} | "
-                            f"order_id={order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
+                            f"[WaitService] ✅ Premium received from stream after {waited:.2f}s | "
+                            f"order_id={order_id} | premium={premium}"
                         )
-                        premium = general_app.get_option_premium(
-                            order.symbol, order.expiry, order.strike, order.right
-                        )
-                        
-                        if premium and premium > 0:
-                            logging.info(
-                                f"[WaitService] ✅ Premium fetched successfully | "
-                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                            )
-                            break
-                        else:
-                            logging.warning(
-                                f"[WaitService] Premium fetch returned invalid value | "
-                                f"order_id={order_id} | premium={premium} | attempt={attempt}"
-                            )
-                    except Exception as e:
-                        logging.warning(
-                            f"[WaitService] Premium fetch attempt {attempt} failed | "
-                            f"order_id={order_id} | error={e}"
-                        )
-                    
-                    if attempt < max_attempts:
-                        time.sleep(retry_delay)
+                        break
+                    time.sleep(wait_interval)
+                    waited += wait_interval
                 
                 if not premium or premium <= 0:
-                    error_msg = f"Failed to fetch premium after {max_attempts} attempts"
+                    error_msg = f"Streamed premium not available after {max_wait}s wait"
                     logging.error(f"[WaitService] {error_msg} | order_id={order_id}")
                     order.mark_failed(error_msg)
                     return
