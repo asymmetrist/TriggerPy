@@ -58,7 +58,13 @@ class ArcTriggerApp(tk.Tk):
         super().__init__()
         self.title("ArcTriggerPy")
         self.configure(bg="black")
-        self.iconbitmap(resource_path("icon.ico"))
+        # ✅ Make icon loading optional (won't crash if icon missing)
+        try:
+            icon_path = resource_path("icon.ico")
+            if os.path.exists(icon_path):
+                self.iconbitmap(icon_path)
+        except Exception as e:
+            logging.debug(f"Could not load icon: {e}")
         # Set global app instance immediately when app is created
         global _app_instance
         _app_instance = self
@@ -395,12 +401,23 @@ class ArcTriggerApp(tk.Tk):
 # ---------- ENTRY ----------
 if __name__ == "__main__":
     import atexit
+    import traceback
     atexit.register(lambda: os.path.exists("arctrigger.dat") or None)
 
-    setup_logging()
-    app = ArcTriggerApp()
-    # Store global reference for popup dialogs (module-level variable)
-    _app_instance = app
-    logging.info(f"[main] Global app instance set: {_app_instance} (type: {type(_app_instance)})")
-    logging.info(f"[main] get_app_instance() test: {get_app_instance()}")
-    app.mainloop()
+    try:
+        setup_logging()
+        logging.info("Starting ArcTrigger application...")
+        app = ArcTriggerApp()
+        # _app_instance is already set in ArcTriggerApp.__init__()
+        logging.info("Application initialized successfully")
+        app.mainloop()
+    except Exception as e:
+        error_msg = f"Fatal error during startup: {e}\n\n{traceback.format_exc()}"
+        logging.critical(error_msg)
+        print("\n" + "="*60)
+        print("FATAL ERROR - Application failed to start")
+        print("="*60)
+        print(error_msg)
+        print("="*60)
+        input("\nPress Enter to exit...")
+        raise

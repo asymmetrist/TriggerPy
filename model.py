@@ -585,44 +585,27 @@ class AppModel:
         if not self._validate_breakout_trigger(trigger_price, current_price):
             raise ValueError("Invalid breakout trigger")
 
-        # --- 2. option premium (SLOW – ONCE) ---
-        premium = general_app.get_option_premium(
-            self._symbol, self._expiry, self._strike, self._right
-        )
+        # --- 2. Premium fetching removed - will be done at RTH open in _finalize_order() with retry logic ---
+        # --- 3. SL / TP defaults (using placeholder, will be recalculated with actual premium) ---
+        sl = self._stop_loss  # Will be recalculated in _finalize_order
+        tp = self._take_profit  # Will be recalculated in _finalize_order
 
-        if premium is None or premium <= 0:
-            premium = max(round(current_price * 0.01, 2), 0.1)
-
-        # --- 3. tick rounding ---
-        mid = premium + arcTick
-        if mid < 3:
-            tick = 0.01
-        elif mid >= 5:
-            tick = 0.15
-        else:
-            tick = 0.05
-
-        entry_price = round(int(mid / tick) * tick, 2)
-
-        # --- 4. SL / TP defaults ---
-        sl = self._stop_loss or round(entry_price * 0.8, 2)
-        tp = self._take_profit or round(entry_price * 1.2, 2)
-
-        # --- 5. build order ---
+        # --- 4. build order (without premium/entry_price/qty - will be set in _finalize_order) ---
         order = Order(
             symbol=self._symbol,
             expiry=self._expiry,
             strike=self._strike,
             right=self._right,
             type=type,
-            qty=quantity,
-            entry_price=entry_price,
+            qty=None,  # Will be calculated in _finalize_order from premium
+            entry_price=None,  # Will be calculated in _finalize_order from premium
             tp_price=tp,
             sl_price=sl,
             action=action.upper(),
             trigger=trigger_price,
         )
         order.set_position_size(float(position))
+        order._order_ready = False  # Mark as not ready - premium will be fetched at RTH open
 
         # --- 6. attach callback EARLY ---
         cb = status_callback or self._status_callback
@@ -635,13 +618,16 @@ class AppModel:
         return order
 
     def _resolve_mid_premium(self, current_price: float, arcTick: float) -> float:
+        """
+        Fetch premium with NO fallback - raises ValueError if premium unavailable.
+        Premium fetching with retry is handled in _finalize_order() at RTH open.
+        """
         premium = general_app.get_option_premium(
             self._symbol, self._expiry, self._strike, self._right
         )
 
         if premium is None or premium <= 0:
-            logging.warning("place_option_order: No live premium → using fallback from underlying.")
-            premium = max(round((current_price or 1) * 0.01, 2), 0.1)
+            raise ValueError(f"No live premium available for {self._symbol} {self._expiry} {self._strike}{self._right}")
 
         mid = premium + arcTick
 
@@ -680,14 +666,14 @@ class AppModel:
         if not self._validate_breakout_trigger(trigger_price, current_price):
             raise ValueError(f"Trigger {trigger_price} invalid for current price {current_price}")
 
-        # --- premium resolved ONCE ---
-        mid_premium = self._resolve_mid_premium(current_price, arcTick)
-
-        # --- SL / TP defaults ---
+        # ✅ ALWAYS defer premium fetching to pipeline (at trigger time)
+        # Premium will be fetched when trigger hits using real-time stream or snapshot retry
+        
+        # --- SL / TP defaults (using placeholders, will be recalculated with actual premium) ---
         if self._stop_loss is None:
-            self._stop_loss = round(mid_premium * 0.8, 2)
+            self._stop_loss = 0.5  # Placeholder, will be recalculated
         if self._take_profit is None:
-            self._take_profit = round(mid_premium * 1.2, 2)
+            self._take_profit = 1.2  # Placeholder, will be recalculated
 
         order = Order(
             symbol=self._symbol,
@@ -695,8 +681,8 @@ class AppModel:
             strike=self._strike,
             right=self._right,
             type=type,
-            qty=quantity,
-            entry_price=mid_premium,
+            qty=None,  # Will be calculated in _finalize_order from premium
+            entry_price=None,  # Will be calculated in _finalize_order from premium
             tp_price=self._take_profit,
             sl_price=self._stop_loss,
             action=action.upper(),
@@ -704,7 +690,14 @@ class AppModel:
         )
 
         order.set_position_size(float(position))
-        order._order_ready = True
+        order._order_ready = False  # ✅ ALWAYS False - pipeline will fetch premium
+        
+        # ✅ Store model and args for pipeline to use
+        order._model = self
+        order._args = {
+            "arcTick": arcTick,
+            "position": position
+        }
 
         cb = status_callback or self._status_callback
         if cb:
