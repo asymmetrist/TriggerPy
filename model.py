@@ -745,7 +745,8 @@ class AppModel:
             "position": position,
             "quantity": quantity,
             "trigger_price": trigger_price,
-            "status_callback": status_callback
+            "status_callback": status_callback,
+            "type": type  # ✅ FIX: Include order type (LMT/MKT) from UI
         }
 
         cb = status_callback or self._status_callback

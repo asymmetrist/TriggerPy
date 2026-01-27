@@ -84,7 +84,7 @@ class OrderWaitService:
                                 quantity=_args["quantity"],
                                 trigger_price=_args["trigger_price"],
                                 arcTick=_args["arcTick"],
-                                type="LMT",
+                                type=_args.get("type", "LMT"),  # ✅ FIX: Use order type from UI, default to LMT
                                 status_callback=_args["status_callback"]
                             )
                             order = _order
@@ -463,6 +463,9 @@ class OrderWaitService:
             self.pending_orders[order_id] = order
         logging.debug(f"[ADD_ORDER] Order added to pending_orders dict | order_id={order_id}")
 
+        # UI callback for status updates
+        cb = getattr(order, "_status_callback", None)
+        
         # ✅ START PREMIUM STREAM FIRST (before checking trigger)
         if order.trigger:  # Only stream if order has trigger
             stream_start = time.time() * 1000
@@ -471,6 +474,8 @@ class OrderWaitService:
                 f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
                 f"timestamp={stream_start:.0f}ms"
             )
+            if cb:
+                cb(f"Starting premium stream for {order.symbol}...", "blue")
             self._start_premium_stream(order)
             stream_latency = time.time() * 1000 - stream_start
             logging.info(
@@ -512,6 +517,11 @@ class OrderWaitService:
         watcher_start = time.time() * 1000
         self.start_trigger_watcher(order, mode) # 💡 Simplified to use the router
         watcher_latency = time.time() * 1000 - watcher_start
+        
+        # ✅ UI: Show watcher armed status
+        if cb:
+            trigger_dir = "↑" if order.action == "BUY" else "↓"
+            cb(f"🎯 Watcher ARMED | Trigger: {trigger_dir}{order.trigger}", "green")
         
         total_latency = time.time() * 1000 - add_start
         logging.info(
@@ -602,23 +612,65 @@ class OrderWaitService:
                     f"conID={conid} | latency={conid_latency:.1f}ms"
                 )
             else:
-                # Resolve conId
+                # Resolve conId with retry logic and UI feedback
                 logging.info(f"[PREMIUM_STREAM] Resolving conID (cache miss) | order_id={order.order_id}")
                 from ibapi.contract import Contract
                 contract = self.tws.create_option_contract(
                     order.symbol, order.expiry, order.strike, order.right
                 )
-                conid = self.tws.resolve_conid(contract, timeout=5)
+                
+                # UI callback for status updates
+                cb = getattr(order, "_status_callback", None)
+                
+                # Retry logic: 3 attempts with 15s timeout each
+                max_retries = 3
+                conid = None
+                
+                for attempt in range(max_retries):
+                    attempt_start = time.time() * 1000
+                    
+                    # Update UI to show conID resolution in progress
+                    if cb:
+                        cb(f"Resolving option conID... (attempt {attempt + 1}/{max_retries})", "blue")
+                    
+                    logging.info(
+                        f"[PREMIUM_STREAM] ConID resolution attempt {attempt + 1}/{max_retries} | "
+                        f"order_id={order.order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right}"
+                    )
+                    
+                    conid = self.tws.resolve_conid(contract, timeout=15)
+                    attempt_latency = time.time() * 1000 - attempt_start
+                    
+                    if conid:
+                        logging.info(
+                            f"[PREMIUM_STREAM] ✅ ConID resolved on attempt {attempt + 1} | "
+                            f"order_id={order.order_id} | conID={conid} | latency={attempt_latency:.1f}ms"
+                        )
+                        if cb:
+                            cb(f"ConID resolved: {conid}", "green")
+                        break
+                    else:
+                        logging.warning(
+                            f"[PREMIUM_STREAM] ConID attempt {attempt + 1} failed | "
+                            f"order_id={order.order_id} | latency={attempt_latency:.1f}ms"
+                        )
+                        if attempt < max_retries - 1:
+                            # Wait a bit before retry
+                            time.sleep(1)
+                
                 conid_latency = time.time() * 1000 - conid_start
                 
                 if not conid:
                     total_latency = time.time() * 1000 - stream_start
                     logging.error(
-                        f"[PREMIUM_STREAM] ❌ ConID resolution failed | order_id={order.order_id} | "
-                        f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
+                        f"[PREMIUM_STREAM] ❌ ConID resolution failed after {max_retries} attempts | "
+                        f"order_id={order.order_id} | symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
                         f"conid_latency={conid_latency:.1f}ms total={total_latency:.1f}ms"
                     )
+                    if cb:
+                        cb(f"❌ ConID resolution failed after {max_retries} attempts", "red")
                     return
+                    
                 # Cache it
                 self.tws._pre_conid_cache[key] = conid
                 logging.info(
@@ -1238,6 +1290,11 @@ class OrderWaitService:
         import time
         finalize_start = time.time() * 1000
         
+        # ✅ UI: Show trigger hit status
+        cb = getattr(order, "_status_callback", None)
+        if cb:
+            cb(f"🚨 TRIGGER HIT @ {last_price:.2f} | Executing...", "orange")
+        
         logging.info(
             f"[FINALIZE] Starting order finalization | order_id={order_id} | "
             f"symbol={order.symbol} {order.expiry} {order.strike}{order.right} | "
@@ -1261,11 +1318,15 @@ class OrderWaitService:
                 f"[FINALIZE] ❌ FAILED | order_id={order_id} | "
                 f"pipeline_latency={pipeline_latency:.1f}ms total={total_latency:.1f}ms"
             )
+            if cb:
+                cb(f"❌ Order FAILED | {order.symbol}", "red")
         else:
             logging.info(
                 f"[FINALIZE] ✅ SUCCESS | order_id={order_id} | "
                 f"pipeline_latency={pipeline_latency:.1f}ms total={total_latency:.1f}ms"
             )
+            if cb:
+                cb(f"✅ Order SENT | {order.symbol} | Waiting for fill...", "green")
 
     def get_order_status(self, order_id: str):
         return self.tws.get_order_status(order_id)
