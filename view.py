@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk
 import logging
 import threading
+import os
+import sys
 from typing import Optional, Callable
 
 from model import general_app, get_model, AppModel
@@ -11,16 +13,59 @@ from Helpers.Order import OrderState
 from Services.nasdaq_info import is_market_closed_or_pre_market
 from Services.order_wait_service import wait_service
 from Services.amo_service import amo, LOSS
+
+# Try to import PIL for image support
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    logging.warning("PIL/Pillow not available - banner will use text only")
+
+def resource_path(relative_path):
+    """Get resource path - works for both development and PyInstaller builds."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
 # ---------------- Banner ----------------
 class Banner(tk.Canvas):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, height=60, bg="black", highlightthickness=0, **kwargs)
-        self.create_text(20, 30, anchor="w", text="ARCTRIGGER",
-                         font=("Arial Black", 24, "bold"), fill="#A020F0")
-        # Version number
-        self.create_text(220, 30, anchor="w", text="MV 1.1",
-                         font=("Arial", 12, "bold"), fill="#00FF00")
+        
+        # Try to load logo image
+        logo_image = None
+        if PIL_AVAILABLE:
+            try:
+                logo_path = resource_path("banner_logo.png")
+                if os.path.exists(logo_path):
+                    img = Image.open(logo_path)
+                    # Resize to fit banner height (60px) while maintaining aspect ratio
+                    img_width, img_height = img.size
+                    if img_height != 60:
+                        aspect_ratio = img_width / img_height
+                        new_width = int(60 * aspect_ratio)
+                        img = img.resize((new_width, 60), Image.Resampling.LANCZOS)
+                    logo_image = ImageTk.PhotoImage(img)
+                    # Display logo at the left side
+                    self.create_image(0, 0, anchor="nw", image=logo_image)
+                    # Keep reference to prevent garbage collection
+                    self.logo_image = logo_image
+                    logging.info("Banner logo image loaded successfully")
+            except Exception as e:
+                logging.warning(f"Could not load banner logo: {e}")
+        
+        # If no image loaded, use text logo
+        if logo_image is None:
+            self.create_text(20, 30, anchor="w", text="ARCTRIGGER",
+                             font=("Arial Black", 24, "bold"), fill="#A020F0")
+            # Version number
+            self.create_text(220, 30, anchor="w", text="MV 1.1",
+                             font=("Arial", 12, "bold"), fill="#00FF00")
 
+        # Connection status and market info (positioned to the right)
         self.connection_status = self.create_text(
             400, 30, anchor="w", text="🔴 DISCONNECTED", font=("Arial", 10), fill="red"
         )
@@ -271,7 +316,7 @@ class OrderFrame(tk.Frame):
         self.btn_be.pack(side="left", padx=3)
 
         self.btn_fo = ttk.Button(self.frame_actions, text="Flatten out",
-                                command=self._on_breakeven)
+                                command=self._on_flatten_out)
 
         self.btn_fo.pack(side=tk.LEFT,padx=3)
         self.tp_buttons = []
@@ -896,12 +941,29 @@ class OrderFrame(tk.Frame):
         logging.info(f"[Flatten_out] starting")
         def worker():
             try:
-                if self.model and self.model.order:
-                    order = self.model.order
-                    order_manager.breakeven(order.order_id)
+                if not self.model:
+                    self._ui(lambda: self._set_status("Error: No model", "red"))
+                    return
+                
+                # Find the most recent finalized BUY order for this symbol
+                from Services.order_manager import order_manager
+                finalized = None
+                for order_id, order in order_manager.finalized_orders.items():
+                    if order.symbol == self.model.symbol and order.action == "BUY":
+                        finalized = order
+                        break
+                
+                if not finalized:
+                    self._ui(lambda: self._set_status("Flatten out Error: No active position", "red"))
+                    logging.warning(f"[Flatten_out] No finalized BUY order found for {self.model.symbol}")
+                    return
+                
+                # Use breakeven method which actually flattens the position (sells 100% at market)
+                result = order_manager.breakeven(finalized.order_id)
+                if result:
                     self._ui(lambda: self._set_status("Flatten out triggered", "blue"))
                 else:
-                    self._ui(lambda: self._set_status("Error: No active order", "red"))
+                    self._ui(lambda: self._set_status("Flatten out Error: Failed to execute", "red"))
             except Exception as e:
                 logging.error(f"FLATTEN_OUT error: {e}")
                 self._ui(lambda: self._set_status(f"FLATTEN_OUT Error: {e}", "red"))
