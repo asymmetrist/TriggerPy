@@ -585,6 +585,9 @@ class OrderWaitService:
             f"key={key} | timestamp={stream_start:.0f}ms"
         )
         
+        # Get UI callback for status updates (available throughout function)
+        cb = getattr(order, "_status_callback", None)
+        
         with self._stream_lock:
             # Check if stream already exists
             if key in self._premium_streams:
@@ -596,6 +599,8 @@ class OrderWaitService:
                     f"[PREMIUM_STREAM] ✅ Reusing existing stream | order_id={order.order_id} | "
                     f"req_id={existing_req_id} | latency={latency:.1f}ms (reused)"
                 )
+                if cb:
+                    cb(f"✅ Reusing existing stream | req_id={existing_req_id}", "green")
                 return
             
             # Need to start new stream
@@ -608,6 +613,8 @@ class OrderWaitService:
                     f"[PREMIUM_STREAM] ConID from cache | order_id={order.order_id} | "
                     f"conID={conid} | latency={conid_latency:.1f}ms"
                 )
+                if cb:
+                    cb(f"ConID from cache: {conid}", "green")
             else:
                 # Resolve conId with retry logic and UI feedback
                 logging.info(f"[PREMIUM_STREAM] Resolving conID (cache miss) | order_id={order.order_id}")
@@ -615,9 +622,6 @@ class OrderWaitService:
                 contract = self.tws.create_option_contract(
                     order.symbol, order.expiry, order.strike, order.right
                 )
-                
-                # UI callback for status updates
-                cb = getattr(order, "_status_callback", None)
                 
                 # Retry logic: 3 attempts with 15s timeout each
                 max_retries = 3
@@ -715,12 +719,16 @@ class OrderWaitService:
                     f"req_latency={req_latency:.1f}ms total={total_latency:.1f}ms | "
                     f"timestamp={time.time()*1000:.0f}ms"
                 )
+                if cb:
+                    cb(f"✅ Premium stream started | req_id={req_id}", "green")
             except Exception as e:
                 total_latency = time.time() * 1000 - stream_start
                 logging.error(
                     f"[PREMIUM_STREAM] ❌ Failed to start | order_id={order.order_id} | "
                     f"error={e} | total_latency={total_latency:.1f}ms"
                 )
+                if cb:
+                    cb(f"❌ Failed to start premium stream: {e}", "red")
                 # Cleanup on error
                 del self._premium_streams[key]
                 del self._premium_streams_by_req_id[req_id]

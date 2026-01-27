@@ -937,8 +937,39 @@ class OrderFrame(tk.Frame):
                 
                 # ✅ Find the exit order (stop loss watcher) for this original order
                 from model import general_app
-                wait_service = general_app.get_order_wait_service()
-                exit_order = wait_service.find_exit_order_by_original_id(finalized.order_id)
+                from Services.watcher_info import watcher_info
+                
+                wait_service = general_app.order_wait
+                
+                if not wait_service:
+                    self._ui(lambda: self._set_status("Breakeven Error: Wait service not available", "red"))
+                    logging.warning(f"[Breakeven] Wait service not available")
+                    return
+                
+                # Search for exit order by previous_id in multiple places:
+                # 1. Check active_stop_losses (WS mode)
+                exit_order = None
+                with wait_service.lock:
+                    for order_id, order in wait_service.active_stop_losses.items():
+                        if hasattr(order, 'previous_id') and order.previous_id == finalized.order_id:
+                            exit_order = order
+                            break
+                
+                # 2. If not found, check watcher_info (polling mode)
+                if not exit_order:
+                    # Get all watchers and check their orders
+                    all_watchers = watcher_info.list_all()
+                    for watcher_dict in all_watchers:
+                        if watcher_dict.get('watcher_type') == 'stop_loss':
+                            watcher_order_id = watcher_dict.get('order_id')
+                            if watcher_order_id:
+                                # Get the ThreadInfo object
+                                thread_info = watcher_info.get_watcher(watcher_order_id)
+                                if thread_info and thread_info.order:
+                                    order = thread_info.order
+                                    if hasattr(order, 'previous_id') and order.previous_id == finalized.order_id:
+                                        exit_order = order
+                                        break
                 
                 if not exit_order:
                     self._ui(lambda: self._set_status("Breakeven Error: Stop loss watcher not found", "red"))
