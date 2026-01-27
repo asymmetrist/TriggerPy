@@ -135,7 +135,6 @@ class OrderWaitService:
                     tinfo.update_status(STATUS_RUNNING, last_price=last_price)
 
                 if last_price and order.is_triggered(last_price):
-                    import time
                     trigger_ts = time.time() * 1000
                     logging.info(
                         f"[TRIGGER_POLL] 🚨 TRIGGERED! | order_id={order_id} | "
@@ -449,7 +448,6 @@ class OrderWaitService:
         mode="ws"   -> subscribe to live ticks (original behavior)
         mode="poll" -> start a polling thread using snapshot
         """
-        import time
         add_start = time.time() * 1000
         
         order_id = order.order_id
@@ -578,7 +576,6 @@ class OrderWaitService:
 
     def _start_premium_stream(self, order: Order):
         """Start streaming bid/ask ticks for option premium (real-time cache)"""
-        import time
         stream_start = time.time() * 1000
         
         key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
@@ -823,7 +820,6 @@ class OrderWaitService:
 
     def _on_tick(self, order_id: str, price: float):
         """Callback from PolygonService for live ENTRY triggers."""
-        import time
         tick_ts = time.time() * 1000
         
         with self.lock:
@@ -1287,7 +1283,6 @@ class OrderWaitService:
         - Fill waiting
         - Stop-loss watcher setup
         """
-        import time
         finalize_start = time.time() * 1000
         
         # ✅ UI: Show trigger hit status
