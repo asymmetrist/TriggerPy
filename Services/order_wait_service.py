@@ -272,7 +272,8 @@ class OrderWaitService:
         tinfo = ThreadInfo(order_id, order.symbol,
                          watcher_type="stop_loss",
                          mode=mode, # 💡 Pass mode to info
-                         stop_loss=stop_loss_price)
+                         stop_loss=stop_loss_price,
+                         order=order)  # ✅ Store the order object so breakeven can find it
         self.set_stop_loss(order, stop_loss_price)
         watcher_info.add_watcher(tinfo)
         tinfo.update_status(STATUS_RUNNING)
@@ -425,7 +426,7 @@ class OrderWaitService:
                 if triggered:
                     logging.info(
                         f"[StopLoss-POLL] 🚨 TRIGGERED! {order.symbol} "
-                        f"Price {last_price} vs Stop {stop_loss_price}"
+                        f"Price {last_price} vs Stop {sl}"
                     )
                     live_qty = int(pos["qty"])
                     
@@ -463,6 +464,10 @@ class OrderWaitService:
 
         # UI callback for status updates
         cb = getattr(order, "_status_callback", None)
+        if not cb:
+            logging.warning(f"[ADD_ORDER] ⚠️ No status callback available | order_id={order_id}")
+        else:
+            logging.debug(f"[ADD_ORDER] ✅ Status callback available | order_id={order_id}")
         
         # ✅ START PREMIUM STREAM FIRST (before checking trigger)
         if order.trigger:  # Only stream if order has trigger
@@ -587,6 +592,10 @@ class OrderWaitService:
         
         # Get UI callback for status updates (available throughout function)
         cb = getattr(order, "_status_callback", None)
+        if not cb:
+            logging.warning(f"[PREMIUM_STREAM] ⚠️ No status callback available | order_id={order.order_id}")
+        else:
+            logging.debug(f"[PREMIUM_STREAM] ✅ Status callback available | order_id={order.order_id}")
         
         with self._stream_lock:
             # Check if stream already exists

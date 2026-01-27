@@ -1031,6 +1031,7 @@ class OrderFrame(tk.Frame):
                                     order = thread_info.order
                                     if hasattr(order, 'previous_id') and order.previous_id == finalized.order_id:
                                         exit_order = order
+                                        logging.info(f"[Breakeven] Found exit order in watcher_info: {watcher_order_id}")
                                         break
                 
                 if not exit_order:
