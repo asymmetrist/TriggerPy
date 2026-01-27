@@ -191,17 +191,22 @@ class OrderFrame(tk.Frame):
         # When CALL/PUT changes, repopulate strikes AND update model right
         self.var_type.trace_add("write", self._on_type_changed)
 
-        # --- THIS IS THE FIX (Step 4 - Checkbox method) ---
-        ttk.Label(self, text="Type").grid(row=1, column=8)
-        ttk.Label(self, text="LMT").grid(row=1, column=9) # Keep LMT label static
-
-        # Add a BooleanVar for the checkbox state
-        self.var_is_lmt = tk.BooleanVar(value=True) # Default to True (LMT)
-
-        # Add the Checkbutton next to the LMT label
-        self.chk_lmt_type = ttk.Checkbutton(self, variable=self.var_is_lmt)
-        self.chk_lmt_type.grid(row=1, column=10, padx=(0, 5), sticky="w") # Place in next column
-        # --- END FIX ---
+        # --- Order Type Toggle (LMT/MKT) ---
+        ttk.Label(self, text="Order Type").grid(row=1, column=8)
+        
+        # Dynamic label that shows current selection
+        self.var_is_lmt = tk.BooleanVar(value=False)  # Default to MKT (unchecked)
+        self.lbl_order_type = ttk.Label(self, text="MKT", font=("Arial", 10, "bold"))
+        self.lbl_order_type.grid(row=1, column=9, padx=(0, 2))
+        
+        # Checkbox to toggle between MKT (unchecked) and LMT (checked)
+        self.chk_lmt_type = ttk.Checkbutton(
+            self, 
+            variable=self.var_is_lmt,
+            command=self._update_order_type_label
+        )
+        self.chk_lmt_type.grid(row=1, column=10, padx=(0, 5), sticky="w")
+        # --- END Order Type ---
 
         # --- Position Size ---
         ttk.Label(self, text="Position Size").grid(row=2, column=0)
@@ -332,6 +337,12 @@ class OrderFrame(tk.Frame):
         
         threading.Thread(target=worker, daemon=True).start()
 
+    def _update_order_type_label(self):
+        """Update the order type label when checkbox changes."""
+        if self.var_is_lmt.get():
+            self.lbl_order_type.config(text="LMT")
+        else:
+            self.lbl_order_type.config(text="MKT")
 
     def _populate_strike_combo(self, centre: float):
         """
@@ -706,6 +717,7 @@ class OrderFrame(tk.Frame):
             quantity = int(self.entry_qty.get() or 1)
             trigger_str = self.entry_trigger.get()
             self.type = "LMT" if self.var_is_lmt.get() else "MKT"
+            logging.info(f"[UI] Order type selected: {self.type} (checkbox={self.var_is_lmt.get()})")
             trigger = float(trigger_str) if trigger_str else None
             sl = float(self.entry_sl.get()) if self.entry_sl.get() else None
             tp = float(self.entry_tp.get()) if self.entry_tp.get() else None
