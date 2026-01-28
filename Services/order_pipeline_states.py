@@ -240,12 +240,13 @@ class CalculatingState(OrderPipelineState):
         self.order.entry_price = entry_price
         
         # Update qty if not set
+        # Calculate qty using entry_price * 100 (options are per-share, contracts are 100 shares)
         if not self.order.qty or self.order.qty <= 0:
-            qty = int(position_size // premium) if premium > 0 else 1
+            qty = int(position_size // (entry_price * 100)) if entry_price > 0 else 1
             if qty <= 0:
                 qty = 1
             self.order.qty = qty
-            self.log(f"Calculated qty | position_size=${position_size} premium={premium} → qty={qty}")
+            self.log(f"Calculated qty | position_size=${position_size} entry_price={entry_price} → qty={qty}")
         
         # Set SL/TP if not already set (fallback to model defaults)
         if not self.order.sl_price:
