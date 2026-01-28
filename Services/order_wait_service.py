@@ -49,6 +49,18 @@ class OrderWaitService:
         with self._arclock:
             self._stoplosses[order.order_id] =stop_loss_price
 
+    def get_current_underlying_price(self, symbol: str) -> Optional[float]:
+        """Current underlying price (e.g. for trigger re-check before place at open)."""
+        p = self.polygon.get_last_trade(symbol)
+        if p is not None and isinstance(p, (int, float)) and p > 0:
+            return float(p)
+        snap = self.polygon.get_snapshot(symbol)
+        if isinstance(snap, dict):
+            last = snap.get("last")
+            if last is not None and isinstance(last, (int, float)) and last > 0:
+                return float(last)
+        return None
+
     def _poll_snapshot_thread(self, order_id: str, order: Order, tinfo: ThreadInfo):
         """
         Inner polling thread logic for trigger watcher (formerly _poll_snapshot).
@@ -828,6 +840,21 @@ class OrderWaitService:
                 f"[WaitService] Stream exists but no valid price data yet for {order.symbol} | "
                 f"bid={bid} ask={ask} mid={mid} | age={age:.2f}s"
             )
+        
+        return None
+
+    def get_streamed_ask(self, order: Order) -> Optional[float]:
+        """Get ask price from active stream - returns None if stream not available"""
+        key = (order.symbol.upper(), order.expiry, float(order.strike), order.right.upper())
+        
+        with self._stream_lock:
+            stream = self._premium_streams.get(key)
+            if not stream:
+                return None
+            
+            ask = stream.get("ask")
+            if ask and ask > 0:
+                return ask
         
         return None
 

@@ -21,6 +21,20 @@ from datetime import datetime
 import pytz
 
 
+def _is_near_market_open() -> bool:
+    """Within first 30 seconds of 9:30 AM ET (stream delay at open)."""
+    try:
+        from datetime import time as dt_time
+        EASTERN = pytz.timezone("US/Eastern")
+        now = datetime.now(EASTERN)
+        if not is_market_open(now):
+            return False
+        market_open_time = datetime.combine(now.date(), dt_time(9, 30), tzinfo=EASTERN)
+        return 0 <= (now - market_open_time).total_seconds() <= 30
+    except Exception:
+        return False
+
+
 class PipelineState(Enum):
     """Pipeline execution states"""
     PENDING = "pending"
@@ -103,36 +117,16 @@ class PremiumFetchingState(OrderPipelineState):
     def __init__(self, order: Order, context: 'OrderPipelineContext', retry_count: int = 0):
         super().__init__(order, context)
         self.retry_count = retry_count
-        self.max_retries = 3
-        
-        # ✅ FIX: Longer wait time at market open when NBBO might not be available yet
-        if self._is_near_market_open():
-            self.max_wait = 2.0  # 2 seconds at market open (reduced from 5s for faster execution)
-            self.log("Market just opened - using extended wait time for NBBO", "info")
+        # At open: premium stream can be delayed 6–7s; give T+7s to get premium before failing
+        if _is_near_market_open():
+            self.max_retries = 5
+            self.max_wait = 7.0
+            self.log("Market just opened - extended wait (7s) and 5 retries for premium stream", "info")
         else:
-            self.max_wait = 1.0  # 1 second normally
-        
+            self.max_retries = 3
+            self.max_wait = 1.0
         self.wait_interval = 0.05
-    
-    def _is_near_market_open(self) -> bool:
-        """Check if we're within 10 seconds of market open (9:30 AM ET)"""
-        try:
-            EASTERN = pytz.timezone("US/Eastern")
-            now = datetime.now(EASTERN)
-            
-            # Check if market is open
-            if not is_market_open(now):
-                return False
-            
-            # Check if we're within 10 seconds of 9:30 AM (reduced for faster execution)
-            from datetime import time as dt_time
-            market_open_time = datetime.combine(now.date(), dt_time(9, 30), tzinfo=EASTERN)
-            time_since_open = (now - market_open_time).total_seconds()
-            
-            return 0 <= time_since_open <= 10  # Within first 10 seconds
-        except Exception:
-            return False  # Safe fallback
-    
+
     def execute(self) -> Optional[OrderPipelineState]:
         self.log(f"Fetching premium (attempt {self.retry_count + 1}/{self.max_retries})")
         
@@ -173,31 +167,10 @@ class PremiumFetchingState(OrderPipelineState):
                     self.log(f"Premium not available, retrying... (retry {self.retry_count + 1}/{self.max_retries})")
                     return PremiumFetchingState(self.order, self.context, self.retry_count + 1)
                 else:
-                    # ✅ FIX: At market open, try snapshot fallback if stream doesn't have NBBO
-                    if self._is_near_market_open():
-                        self.log("Stream has no NBBO at market open - trying snapshot fallback", "warning")
-                        try:
-                            snapshot = self.context.tws.get_option_snapshot(
-                                self.order.symbol, self.order.expiry, self.order.strike, self.order.right, timeout=5
-                            )
-                            if snapshot and snapshot.get("mid") and snapshot["mid"] > 0:
-                                premium = snapshot["mid"]
-                                self.log(f"✅ Premium from snapshot fallback: {premium} (market open)", "info")
-                            else:
-                                error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries, snapshot also failed"
-                                self.log(error_msg, "error")
-                                self.order.mark_failed(error_msg)
-                                return FailedState(self.order, self.context, error_msg)
-                        except Exception as e:
-                            error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries, snapshot fallback failed: {e}"
-                            self.log(error_msg, "error")
-                            self.order.mark_failed(error_msg)
-                            return FailedState(self.order, self.context, error_msg)
-                    else:
-                        error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries"
-                        self.log(error_msg, "error")
-                        self.order.mark_failed(error_msg)
-                        return FailedState(self.order, self.context, error_msg)
+                    error_msg = f"Streamed premium not available after {self.max_wait}s wait and {self.max_retries} retries"
+                    self.log(error_msg, "error")
+                    self.order.mark_failed(error_msg)
+                    return FailedState(self.order, self.context, error_msg)
         
         # Store premium for next state
         self.context.premium = premium
@@ -230,29 +203,38 @@ class CalculatingState(OrderPipelineState):
         model = getattr(self.order, "_model", None)
         _args = getattr(self.order, "_args", {})
         arcTick = _args.get("arcTick", 0.01)
-        position_size = getattr(self.order, "_position_size", _args.get("position", 2000))
         
-        # Recalculate SL/TP based on actual premium (if they were placeholders)
-        if self.order.sl_price == 0.5 or self.order.tp_price == 1.2:  # Placeholder values
-            old_sl = self.order.sl_price
-            old_tp = self.order.tp_price
-            self.order.sl_price = round(premium * 0.8, 2)
-            self.order.tp_price = round(premium * 1.2, 2)
-            self.log(
-                f"Recalculated SL/TP | premium={premium} | "
-                f"SL: {old_sl} → {self.order.sl_price} | TP: {old_tp} → {self.order.tp_price}"
-            )
+        # Position size should always come from UI - get it from the order
+        position_size = getattr(self.order, "_position_size", None)
+        if position_size is None:
+            error_msg = "Position size not set - should come from UI"
+            self.log(error_msg, "error")
+            self.order.mark_failed(error_msg)
+            return FailedState(self.order, self.context, error_msg)
         
-        # Calculate entry_price from premium + arcTick
-        mid = premium + arcTick
-        if mid < 3:
+        # Calculate entry_price: use ask + arcTick for limit orders, mid + arcTick for market orders
+        if self.order.type == "LMT":
+            # For limit orders, use ask price + arcTick
+            ask = self.context.wait_service.get_streamed_ask(self.order)
+            if not ask or ask <= 0:
+                error_msg = "Ask price not available from stream for limit order"
+                self.log(error_msg, "error")
+                self.order.mark_failed(error_msg)
+                return FailedState(self.order, self.context, error_msg)
+            base_price = ask + arcTick
+        else:
+            # For market orders, use mid (premium) + arcTick
+            base_price = premium + arcTick
+        
+        # Determine tick size based on price level
+        if base_price < 3:
             tick = 0.01
-        elif mid >= 5:
+        elif base_price >= 5:
             tick = 0.15
         else:
             tick = 0.05
         
-        entry_price = round(int(mid / tick) * tick, 2)
+        entry_price = round(int(base_price / tick) * tick, 2)
         
         # Update order with calculated values
         self.order.entry_price = entry_price
@@ -301,7 +283,25 @@ class PlacingState(OrderPipelineState):
             self.log(error_msg, "error")
             self.order.mark_failed(error_msg)
             return FailedState(self.order, self.context, error_msg)
-        
+
+        # At open: fire only if stock still above/below trigger (premium may have delayed us)
+        if _is_near_market_open() and self.order.trigger is not None:
+            price = self.context.wait_service.get_current_underlying_price(self.order.symbol)
+            if price is None:
+                error_msg = "At open: could not get current price for trigger re-check"
+                self.log(error_msg, "error")
+                self.order.mark_failed(error_msg)
+                return FailedState(self.order, self.context, error_msg)
+            if not self.order.is_triggered(price):
+                error_msg = (
+                    f"Trigger invalidated at open | symbol={self.order.symbol} "
+                    f"trigger={self.order.trigger} current={price:.2f} right={self.order.right}"
+                )
+                self.log(error_msg, "warning")
+                self.order.mark_failed(error_msg)
+                return FailedState(self.order, self.context, error_msg)
+            self.log(f"Trigger re-check OK at open | price={price:.2f} trigger={self.order.trigger}", "info")
+
         self.log(
             f"Placing order | entry_price={self.order.entry_price} | qty={self.order.qty} | "
             f"symbol={self.order.symbol} {self.order.right}{self.order.strike}"
